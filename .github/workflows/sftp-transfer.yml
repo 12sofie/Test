@@ -26,13 +26,16 @@ jobs:
 
     - name: Descargar archivos desde servidor origen (X)
       run: |
-        mkdir transfer-temp
+        mkdir -p transfer-temp
         sshpass -p "${{ secrets.ORIGEN_PASS }}" sftp -oStrictHostKeyChecking=no -b - ${{ secrets.ORIGEN_USER }}@${{ github.event.inputs.origen_ip }} <<EOF
         get -r ${{ github.event.inputs.ruta_origen }} transfer-temp/
+        bye
         EOF
 
     - name: Subir archivos a servidor destino (Y)
       run: |
         sshpass -p "${{ secrets.DESTINO_PASS }}" sftp -oStrictHostKeyChecking=no -b - ${{ secrets.DESTINO_USER }}@${{ github.event.inputs.destino_ip }} <<EOF
-        put -r transfer-temp/* ${{ github.event.inputs.ruta_destino }}
+        put -r transfer-temp ${{ github.event.inputs.ruta_destino }}
+        bye
         EOF
+

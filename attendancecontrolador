@@ -1,0 +1,4142 @@
+const db = require("../config/db"); // Importa la conexión a la base de datos
+const dayjs = require("dayjs"); // Librería para manejar fechas y horas
+const utc = require("dayjs/plugin/utc"); // Plugin para manejar UTC
+const timezone = require("dayjs/plugin/timezone"); // Plugin para manejar zonas horarias
+const isoWeek = require("dayjs/plugin/isoWeek"); // Plugin para manejar semanas ISO
+const { io } = require("../app"); // Importar la instancia de Socket.IO
+const getUserIdFromToken = require("../helpers/getUserIdFromToken");
+const { printPermissionTicket } = require("./thermalPrinterController");
+const { t } = require("../i18n/translate");
+const customParseFormat = require("dayjs/plugin/customParseFormat");
+const isSameOrBefore = require("dayjs/plugin/isSameOrBefore");
+const isSameOrAfter = require("dayjs/plugin/isSameOrAfter");
+const {
+  camposAuditoriaADD,
+  camposAuditoriaUPDATE,
+} = require("../helpers/columnasAuditoria");
+const e = require("express");
+const { capitalizar } = require("../helpers/validator");
+const ExcelJS = require("exceljs");
+require("dayjs/locale/es");
+
+function removeAccents(str) {
+  return str ? str.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : str;
+}
+
+// Extender dayjs con los plugins de UTC, Timezone e ISO Week
+dayjs.locale("es");
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.extend(isoWeek);
+dayjs.extend(customParseFormat);
+dayjs.extend(isSameOrBefore);
+dayjs.extend(isSameOrAfter);
+
+// Zona horaria por defecto para TODA la app
+const APP_TZ = process.env.TZ || "America/Tegucigalpa";
+dayjs.tz.setDefault(APP_TZ);
+
+// Función de ayuda para formatear la hora con AM/PM
+const formatTimeWithPeriod = (dayjsDate) => {
+  return dayjsDate.format("hh:mm:ss A");
+};
+
+function getDayNameEnglish(dateStr) {
+  return dayjs(dateStr).locale("en").format("dddd");
+}
+
+const recentNightExitLock = new Map();
+
+function setNightExitLock(employeeID, seconds = 10) {
+  recentNightExitLock.set(Number(employeeID), Date.now() + seconds * 1000);
+}
+
+function remainingNightExitLock(employeeID) {
+  const until = recentNightExitLock.get(Number(employeeID)) || 0;
+  const msLeft = until - Date.now();
+  return msLeft > 0 ? Math.ceil(msLeft / 1000) : 0;
+}
+
+// Función de ayuda para recuperar un registro completo de asistencia
+async function getSingleAttendanceRecord(employeeID, date) {
+  const attendanceQuery = `
+    SELECT 
+      h.hattendanceID, h.employeeID,
+      CONCAT(e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName) AS employeeName,
+      DATE_FORMAT(h.entryTime, '%h:%i:%s %p') AS entryTime,
+      DATE_FORMAT(h.exitTime, '%h:%i:%s %p') AS exitTime,
+      DATE_FORMAT(h.date, '%Y-%m-%d') AS date
+    FROM h_attendance_emp h
+    JOIN employees_emp e ON h.employeeID = e.employeeID
+    WHERE h.employeeID = ? AND h.date = ?
+    LIMIT 1;
+  `;
+  const [attendanceRows] = await db.query(attendanceQuery, [employeeID, date]);
+
+  if (attendanceRows.length === 0) {
+    return null; // No se encontró registro
+  }
+
+  const attendanceRecord = attendanceRows[0];
+
+  const permissionQuery = `
+    SELECT 
+      permissionID,
+      DATE_FORMAT(exitPermission, '%h:%i:%s %p') AS exitPermissionTime,
+      DATE_FORMAT(entryPermission, '%h:%i:%s %p') AS entryPermissionTime,
+      comment
+    FROM permissionattendance_emp
+    WHERE employeeID = ? AND DATE(date) = ?
+    ORDER BY permissionID ASC
+    LIMIT 5;
+  `;
+  const [permissionRows] = await db.query(permissionQuery, [employeeID, date]);
+
+  permissionRows.forEach((permission, index) => {
+    const pNum = index + 1;
+    attendanceRecord[`permissionExitTime${pNum}`] =
+      permission.exitPermissionTime || null;
+    attendanceRecord[`permissionEntryTime${pNum}`] =
+      permission.entryPermissionTime || null;
+    attendanceRecord[`permissionExitID${pNum}`] = permission.permissionID;
+    attendanceRecord[`permissionEntryID${pNum}`] = permission.permissionID;
+    attendanceRecord[`permissionExitComment${pNum}`] = permission.comment || "";
+    attendanceRecord[`permissionEntryComment${pNum}`] =
+      permission.comment || "";
+  });
+
+  const dispatchingQuery = `
+    SELECT 
+      DATE_FORMAT(exitTimeComplete, '%h:%i:%s %p') AS dispatchingTime,
+      CASE WHEN comment = 1 THEN 'Meta' ELSE '' END AS dispatchingComment
+    FROM dispatching_emp
+    WHERE employeeID = ? AND DATE(date) = ?
+    LIMIT 1;
+  `;
+  const [dispatchingRows] = await db.query(dispatchingQuery, [
+    employeeID,
+    date,
+  ]);
+
+  if (dispatchingRows.length > 0) {
+    attendanceRecord.dispatchingTime = dispatchingRows[0].dispatchingTime;
+    attendanceRecord.dispatchingComment = dispatchingRows[0].dispatchingComment;
+  }
+
+  return attendanceRecord;
+}
+
+async function pickUnclosedToClose(
+  db,
+  employeeID,
+  shiftID,
+  todayStr,
+  TZ = "America/Tegucigalpa"
+) {
+  const yesterdayStr = dayjs(todayStr).subtract(1, "day").format("YYYY-MM-DD");
+
+  // A) ¿Abierto exactamente AYER?
+  const [yOpen] = await db.query(
+    `SELECT hattendanceID, date
+       FROM h_attendance_emp
+      WHERE employeeID = ?
+        AND entryTime IS NOT NULL
+        AND exitTime  IS NULL
+        AND DATE(date) = ?
+      ORDER BY date DESC
+      LIMIT 1`,
+    [employeeID, yesterdayStr]
+  );
+
+  if (yOpen.length === 0) {
+    // B) Hay un abierto más viejo (< hoy), pero NO lo vamos a cerrar: sólo avisamos para bloquear
+    const [older] = await db.query(
+      `SELECT hattendanceID, date
+         FROM h_attendance_emp
+        WHERE employeeID = ?
+          AND entryTime IS NOT NULL
+          AND exitTime  IS NULL
+          AND DATE(date) < ?
+        ORDER BY date DESC
+        LIMIT 1`,
+      [employeeID, todayStr]
+    );
+    return older.length ? { tooOld: true, record: older[0] } : null;
+  }
+
+  // C) Calcular ventanas usando el día del registro (AYER)
+  const record = yOpen[0];
+  const refDate = dayjs(record.date);
+  const refDateStr = refDate.format("YYYY-MM-DD");
+  // Normalizar el nombre del día eliminando acentos para coincidir con la base de datos
+
+  const refDayName = getDayNameEnglish(refDateStr);
+
+  // const refDayName = removeAccents(
+  //   refDate.locale("es").format("dddd")
+  // ).toUpperCase();
+
+  const [rows] = await db.query(
+    "SELECT startTime, endTime FROM detailsshift_emp WHERE shiftID = ? AND day = ? LIMIT 1",
+    [shiftID, refDayName]
+  );
+  if (rows.length === 0) {
+    return {
+      record,
+      start: null,
+      end: null,
+      graceEnd: null,
+      noShiftConfig: true,
+    };
+  }
+
+  const start = dayjs(
+    `${refDateStr} ${rows[0].startTime}`,
+    "YYYY-MM-DD HH:mm:ss",
+    TZ
+  );
+  let end = dayjs(
+    `${refDateStr} ${rows[0].endTime}`,
+    "YYYY-MM-DD HH:mm:ss",
+    TZ
+  );
+  if (end.isBefore(start)) end = end.add(1, "day"); // cruza medianoche (18:00→06:00)
+  const graceEnd = end.add(1, "hour");
+
+  return { record, start, end, graceEnd, noShiftConfig: false };
+}
+
+// Funciones de ayuda para verificaciones y actualizaciones de permisos
+async function checkActivePermission(employeeID) {
+  try {
+    const currentDateOnly = dayjs().format("YYYY-MM-DD");
+    const [permissionResults] = await db.query(
+      `SELECT permissionID, exitPermission FROM permissionattendance_emp 
+       WHERE employeeID = ? AND date = ? AND isApproved = 1 AND status = 1 AND exitPermission IS NULL`,
+      [employeeID, currentDateOnly]
+    );
+    return {
+      hasActivePermission: permissionResults.length > 0,
+      permissionData: permissionResults[0],
+      hasExitedWithPermission: permissionResults[0]?.exitPermission !== null,
+    };
+  } catch (error) {
+    console.error("Error al verificar permiso activo:", error);
+    return { hasActivePermission: false, error: error.message };
+  }
+}
+
+async function checkPendingPermissionReturn(employeeID) {
+  try {
+    const currentDateOnly = dayjs().format("YYYY-MM-DD");
+    const [permissionResults] = await db.query(
+      `SELECT permissionID FROM permissionattendance_emp 
+       WHERE employeeID = ? AND date = ? AND exitPermission IS NOT NULL AND entryPermission IS NULL`,
+      [employeeID, currentDateOnly]
+    );
+    return {
+      hasPendingReturn: permissionResults.length > 0,
+      permissionData: permissionResults[0],
+    };
+  } catch (error) {
+    console.error("Error al verificar permiso pendiente de regreso:", error);
+    return { hasPendingReturn: false, error: error.message };
+  }
+}
+
+async function updatePermissionRecordWithExit(permissionID, currentTime) {
+  try {
+    const [result] = await db.query(
+      "UPDATE permissionattendance_emp SET exitPermission = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p'), status = 0 WHERE permissionID = ?",
+      [currentTime, permissionID]
+    );
+
+    if (result.affectedRows === 0) {
+      throw new Error("No se pudo actualizar el registro de permiso.");
+    }
+
+    let errorPrint = "";
+    if (result.affectedRows > 0) {
+      await printPermissionTicket(permissionID, "salida").catch((printErr) => {
+        console.error("Error al imprimir ticket automáticamente:", printErr);
+        errorPrint = "No hay impresoras locales conectadas.";
+      });
+    }
+
+    return { success: result.affectedRows > 0, errorPrint };
+  } catch (error) {
+    console.error("Error al registrar salida con permiso:", error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function updatePermissionRecordWithEntry(permissionID, currentTime) {
+  try {
+    const [result] = await db.query(
+      "UPDATE permissionattendance_emp SET entryPermission = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p'), status = 0 WHERE permissionID = ?",
+      [currentTime, permissionID]
+    );
+    return { success: result.affectedRows > 0 };
+  } catch (error) {
+    console.error("Error al registrar entrada de regreso con permiso:", error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function getShiftEndForEmployeeDate(employeeID, dateStr, TZ = APP_TZ) {
+  // 1) Día en texto (ES, mayúsculas, sin acentos) para cruzarlo con detailsshift_emp.day
+
+  const dayName = getDayNameEnglish(dateStr);
+
+  // const dayName = removeAccents(
+  //   dayjs(dateStr).locale("es").format("dddd")
+  // ).toUpperCase();
+
+  // 2) Traer shift del empleado y su excepción (minutos a restar)
+  const [empRows] = await db.query(
+    `SELECT e.shiftID, COALESCE(ex.exceptionTime, 0) AS exceptionTime
+       FROM employees_emp e
+       LEFT JOIN exceptions_emp ex ON ex.exceptionID = e.exceptionID
+      WHERE e.employeeID = ?
+      LIMIT 1`,
+    [employeeID]
+  );
+  if (empRows.length === 0) return null;
+  const { shiftID, exceptionTime } = empRows[0];
+
+  const [shiftRows] = await db.query(
+    `SELECT startTime, endTime
+       FROM detailsshift_emp
+      WHERE shiftID = ? AND day = ?
+      LIMIT 1`,
+    [shiftID, dayName]
+  );
+  if (shiftRows.length === 0) return null;
+
+  const { startTime, endTime } = shiftRows[0];
+
+  // 4) Construir objetos dayjs y manejar turno nocturno si end < start
+  let start = dayjs(`${dateStr} ${startTime}`, "YYYY-MM-DD HH:mm:ss", TZ);
+  let end = dayjs(`${dateStr} ${endTime}`, "YYYY-MM-DD HH:mm:ss", TZ);
+  if (end.isBefore(start)) end = end.add(1, "day"); // cruza medianoche
+
+  // 5) Aplicar excepción (minutos a restar)
+  if (Number(exceptionTime) > 0) {
+    end = end.subtract(Number(exceptionTime), "minute");
+  }
+
+  // 6) Devolver en 12h y con la fecha correcta (puede ser día siguiente si turno nocturno)
+  const endDateStr = end.format("YYYY-MM-DD");
+  const end12h = end.format("hh:mm:ss A");
+
+  return { endDateStr, end12h };
+}
+
+// Controlador interno para registrar despacho
+async function registerDispatchingInternal(
+  req,
+  res,
+  employeeDetails
+  //shiftDetails
+) {
+  const { employeeID, comment } = req.body;
+  const currentDateTimeCST = dayjs();
+  const currentDateOnly = currentDateTimeCST.format("YYYY-MM-DD");
+  const currentTimeFormatted = formatTimeWithPeriod(currentDateTimeCST);
+
+  const { employeeName, photoUrl } = employeeDetails;
+
+  // Calcula la hora de fin real del turno para hoy (ajustada por excepciones)
+  const shiftEndInfo = await getShiftEndForEmployeeDate(
+    employeeID,
+    currentDateOnly,
+    APP_TZ
+  );
+
+  if (!shiftEndInfo) {
+    throw new Error(
+      `No se encontró hora de fin de turno para el empleado ${employeeID} en la fecha ${currentDateOnly}`
+    );
+  }
+
+  const { endDateStr: scheduledExitDate, end12h: scheduledExit12h } =
+    shiftEndInfo;
+  const scheduledExitTimeSQL = `${scheduledExitDate} ${scheduledExit12h}`;
+
+  try {
+    const pendingReturnStatus = await checkPendingPermissionReturn(employeeID);
+    if (pendingReturnStatus.hasPendingReturn) {
+      return res.status(400).json({
+        message:
+          "No puedes marcar despacho mientras estás fuera con permiso. Registra tu regreso primero.",
+        employeeName,
+        photoUrl,
+      });
+    }
+
+    const [existingDispatch] = await db.query(
+      "SELECT dispatchingID FROM dispatching_emp WHERE employeeID = ? AND DATE(date) = ?",
+      [employeeID, currentDateOnly]
+    );
+    if (existingDispatch.length > 0) {
+      return res.status(400).json({
+        message: "Ya has registrado tu despacho por hoy.",
+        employeeName,
+        photoUrl,
+      });
+    }
+
+    const [attendanceRecordToUpdate] = await db.query(
+      "SELECT hattendanceID FROM h_attendance_emp WHERE employeeID = ? AND DATE(date) = ? AND entryTime IS NOT NULL AND exitTime IS NULL LIMIT 1",
+      [employeeID, currentDateOnly]
+    );
+
+    let attendanceIDToUpdate = null;
+
+    if (attendanceRecordToUpdate.length === 0) {
+      // No hay entrada abierta: creamos un registro de asistencia con solo salida (exitTime = ahora)
+      const userID = getUserIdFromToken(req) || "1";
+      const insertExitOnly = `
+    INSERT INTO h_attendance_emp (employeeID, entryTime, exitTime, date, createdDate, createdBy, updatedBy)
+    VALUES (?, NULL, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?)
+  `;
+      const [insExitOnly] = await db.query(insertExitOnly, [
+        employeeID,
+        currentTimeFormatted,
+        currentDateOnly,
+        dayjs().format("YYYY-MM-DD HH:mm:ss"),
+        userID,
+        userID,
+      ]);
+      attendanceIDToUpdate = insExitOnly.insertId;
+    } else {
+      attendanceIDToUpdate = attendanceRecordToUpdate[0].hattendanceID;
+    }
+
+    const insertDispatchQuery = `
+      INSERT INTO dispatching_emp (employeeID, supervisorID, date, exitTimeComplete, comment)
+      VALUES (?, ?, ?, STR_TO_DATE(?, '%h:%i:%s %p'), ?)
+    `;
+
+    const supervisorID = req.body.supervisorID || null; // Use supervisorID from request, default to null if not provided
+    const comment = 1;
+    const values = [
+      employeeID,
+      supervisorID,
+      currentDateOnly,
+      currentTimeFormatted,
+      comment
+    ];
+
+    const [resultDispatch] = await db.query(insertDispatchQuery, values);
+
+    const updateAttendanceQuery = `
+        UPDATE h_attendance_emp 
+        SET exitTime = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p')
+        WHERE hattendanceID = ?
+    `;
+    const [resultAttendanceUpdate] = await db.query(updateAttendanceQuery, [
+      scheduledExitTimeSQL,
+      attendanceIDToUpdate,
+    ]);
+
+    if (resultAttendanceUpdate.affectedRows === 0) {
+      console.error(
+        `Error: No se pudo actualizar exitTime para hattendanceID ${attendanceIDToUpdate} después de registrar despacho.`
+      );
+    }
+
+    // Emitir registro completo y actualizado
+    const fullRecord = await getSingleAttendanceRecord(
+      employeeID,
+      currentDateOnly
+    );
+
+    return res.status(201).json({
+      message:
+        "Despacho registrado exitosamente. Tu hora de salida ha sido establecida a las " +
+        scheduledExit12h,
+      type: "dispatching",
+      time: currentTimeFormatted,
+      employeeID,
+      employeeName,
+      photoUrl,
+    });
+  } catch (error) {
+    console.error("Error al registrar despacho:", error);
+    return res.status(500).json({
+      message: "Error interno al registrar despacho: " + error.message,
+    });
+  }
+}
+
+// Controlador para obtener registros de asistencia
+exports.getAttendance = async (req, res) => {
+  try {
+    const { startDate, endDate, specificDate, isActive } = req.query;
+
+    if (!specificDate && !(startDate && endDate)) {
+      return res
+        .status(400)
+        .json({ message: "Debe enviar specificDate o startDate y endDate" });
+    }
+    const rangeStart = specificDate || startDate;
+    const rangeEndExclusive = dayjs(specificDate || endDate)
+      .add(1, "day")
+      .format("YYYY-MM-DD");
+
+    // 2) Asistencia (una sola consulta). Ordenada ya en DB
+    let attendanceRows;
+
+    if (specificDate) {
+      // Vista de DÍA: todos los activos, aunque no hayan marcado
+      const [rows] = await db.query(
+        `
+    SELECT
+      h.hattendanceID, e.employeeID, e.managerID, e.requiredAttendance, e.shiftID, 
+      CONCAT(e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName) AS employeeName,
+      DATE_FORMAT(h.entryTime, '%h:%i:%s %p') AS entryTime,
+      DATE_FORMAT(h.exitTime,  '%h:%i:%s %p') AS exitTime,
+      DATE_FORMAT(COALESCE(h.date, ?), '%Y-%m-%d') AS date, h.comment
+    FROM employees_emp e
+    LEFT JOIN h_attendance_emp h
+      ON h.employeeID = e.employeeID
+     AND h.date >= ? AND h.date < ?
+    WHERE e.isActive = 1
+    ORDER BY e.employeeID ASC, h.entryTime ASC
+    `,
+        [rangeStart, rangeStart, rangeEndExclusive]
+      );
+      attendanceRows = rows;
+    } else {
+      // Vista de RANGO (semana/mes): se queda como estaba
+      const [rows] = await db.query(
+        `
+    SELECT 
+      h.hattendanceID, h.employeeID, e.managerID, e.requiredAttendance, e.shiftID,
+      CONCAT(e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName) AS employeeName,
+      DATE_FORMAT(h.entryTime, '%h:%i:%s %p') AS entryTime,
+      DATE_FORMAT(h.exitTime,  '%h:%i:%s %p') AS exitTime,
+      DATE_FORMAT(h.date, '%Y-%m-%d') AS date, h.comment
+    FROM h_attendance_emp h
+    LEFT JOIN employees_emp e ON h.employeeID = e.employeeID
+    WHERE h.date >= ? AND h.date < ? AND e.isActive = ${isActive === "0" ? "0" : "1"
+        }
+    ORDER BY h.date ASC, h.employeeID ASC, h.entryTime ASC
+    `,
+        [rangeStart, rangeEndExclusive]
+      );
+      attendanceRows = rows;
+    }
+
+    const [permRows] = await db.query(
+      `
+      SELECT
+        employeeID,
+        DATE_FORMAT(date, '%Y-%m-%d') AS d,
+        permissionID,
+        DATE_FORMAT(exitPermission,  '%h:%i:%s %p') AS exitPermissionTime,
+        DATE_FORMAT(entryPermission, '%h:%i:%s %p') AS entryPermissionTime,
+        comment
+      FROM permissionattendance_emp
+      WHERE date >= ? AND date < ?
+      ORDER BY employeeID, date, permissionID
+      `,
+      [rangeStart, rangeEndExclusive]
+    );
+
+    // 4) Dispatching para TODO el rango (una sola consulta)
+    const [dispRows] = await db.query(
+      `
+      SELECT
+        employeeID,
+        DATE_FORMAT(date, '%Y-%m-%d') AS d,
+        DATE_FORMAT(exitTimeComplete, '%h:%i:%s %p') AS dispatchingTime,
+        CASE WHEN comment = 1 THEN 'Cumplimiento de Meta' ELSE '' END AS dispatchingComment
+      FROM dispatching_emp
+      WHERE date >= ? AND date < ?
+      `,
+      [rangeStart, rangeEndExclusive]
+    );
+
+    const [presentismo] = await db.query(
+      `
+      SELECT 
+        COUNT(DISTINCT e.employeeID) AS empleados_activos,
+        COUNT(DISTINCT a.employeeID) AS presentes,
+        COUNT(DISTINCT e.employeeID) - COUNT(DISTINCT a.employeeID) AS ausentes,
+        ROUND(
+            (COUNT(DISTINCT a.employeeID) / COUNT(DISTINCT e.employeeID)) * 100,
+            2
+        ) AS porcentaje_presentismo,
+        'TurnoA' shift
+        FROM pmsb.employees_emp e
+        LEFT JOIN pmsb.h_dismissal_emp dis 
+            ON dis.employeeID = e.employeeID
+        LEFT JOIN (
+            SELECT DISTINCT employeeID
+            FROM pmsb.h_attendance_emp
+            WHERE date BETWEEN '${rangeStart}' AND '${rangeEndExclusive}'
+        ) a 
+            ON a.employeeID = e.employeeID
+          WHERE 
+              e.hireDate <= '${rangeEndExclusive}'
+              AND (dis.dateDismissal IS NULL OR dis.dateDismissal > '${rangeStart}')
+              AND e.shiftID = 1
+              AND e.requiredAttendance = 1
+              UNION ALL
+        SELECT 
+            COUNT(DISTINCT e.employeeID) AS empleados_activos,
+            COUNT(DISTINCT a.employeeID) AS presentes,
+            COUNT(DISTINCT e.employeeID) - COUNT(DISTINCT a.employeeID) AS ausentes,
+            ROUND(
+                (COUNT(DISTINCT a.employeeID) / COUNT(DISTINCT e.employeeID)) * 100,
+                2
+            ) AS porcentaje_presentismo,
+            'TurnoB' shift
+        FROM pmsb.employees_emp e
+        LEFT JOIN pmsb.h_dismissal_emp dis 
+            ON dis.employeeID = e.employeeID
+        LEFT JOIN (
+            SELECT DISTINCT employeeID
+            FROM pmsb.h_attendance_emp
+            WHERE date BETWEEN '${rangeStart}' AND '${rangeEndExclusive}'
+        ) a 
+            ON a.employeeID = e.employeeID
+        WHERE 
+            e.hireDate <= '${rangeEndExclusive}'
+            AND (dis.dateDismissal IS NULL OR dis.dateDismissal > '${rangeStart}')
+            AND e.shiftID = 2
+            AND e.requiredAttendance = 1;
+      `
+    );
+
+    // Empleados activos 
+        const [activeEmployees] = await db.query(
+      `
+     SELECT 
+        COUNT(DISTINCT e.employeeID) AS empleados_activos
+      FROM pmsb.employees_emp e
+      LEFT JOIN pmsb.h_dismissal_emp dis 
+          ON dis.employeeID = e.employeeID
+      WHERE 
+      e.hireDate <= '${rangeEndExclusive}'
+      AND (dis.dateDismissal IS NULL OR dis.dateDismissal > '${rangeStart}')
+      `
+    );
+
+    // 5) Indexar permisos y dispatchings por clave (employeeID|YYYY-MM-DD)
+    const permsByKey = new Map();
+    for (const p of permRows) {
+      const key = `${p.employeeID}|${p.d}`;
+      if (!permsByKey.has(key)) permsByKey.set(key, []);
+      // Máximo 5 por día
+      if (permsByKey.get(key).length < 5) permsByKey.get(key).push(p);
+    }
+
+    const dispByKey = new Map();
+    for (const d of dispRows) {
+      const key = `${d.employeeID}|${d.d}`;
+      // si existiera más de uno, nos quedamos con el último (no suele pasar)
+      dispByKey.set(key, d);
+    }
+
+    // 6) Proyectar todo en el mismo shape que espera el frontend
+    const result = attendanceRows.map((a) => {
+      const key = `${a.employeeID}|${a.date}`;
+      const out = { ...a };
+
+      // permisos
+      const perms = permsByKey.get(key) || [];
+      perms.forEach((p, idx) => {
+        const n = idx + 1;
+        out[`permissionExitTime${n}`] = p.exitPermissionTime || "";
+        out[`permissionEntryTime${n}`] = p.entryPermissionTime || "";
+        out[`permissionExitID${n}`] = p.permissionID;
+        out[`permissionEntryID${n}`] = p.permissionID;
+        out[`permissionExitComment${n}`] = p.comment || "";
+        out[`permissionEntryComment${n}`] = p.comment || "";
+      });
+      // completar hasta 5 por consistencia
+      for (let i = perms.length + 1; i <= 5; i++) {
+        out[`permissionExitTime${i}`] = "";
+        out[`permissionEntryTime${i}`] = "";
+        out[`permissionExitComment${i}`] = "";
+        out[`permissionEntryComment${i}`] = "";
+      }
+      out.totalPermissions = perms.length;
+
+      // dispatching
+      const d = dispByKey.get(key);
+      if (d) {
+        out.dispatchingTime = d.dispatchingTime;
+        out.dispatchingComment = d.dispatchingComment;
+      }
+
+      return out;
+    });
+
+    return res.status(200).json({ data: result, presentismo: presentismo, activeEmployees: activeEmployees[0].empleados_activos });
+  } catch (error) {
+    console.error("Error al obtener datos de asistencia (fast):", error);
+    return res
+      .status(500)
+      .json({ message: "Error al obtener datos de asistencia" });
+  }
+};
+
+// Controlador para actualizar comentarios de permisos
+exports.updatePermissionComment = async (req, res) => {
+  try {
+    const { permissionID, comment } = req.body;
+
+    if (!permissionID) {
+      return res
+        .status(400)
+        .json({ message: "El ID del permiso es requerido" });
+    }
+
+    const query = `
+      UPDATE permissionattendance_emp 
+      SET comment = ?
+      WHERE permissionID = ?
+    `;
+
+    const [result] = await db.query(query, [comment, permissionID]);
+
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ message: "Permiso no encontrado" });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Comentario actualizado correctamente",
+      permissionID,
+      comment,
+    });
+  } catch (error) {
+    console.error("Error al actualizar comentario de permiso:", error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar comentario: " + error.message });
+  }
+};
+
+// Controlador registerAttendance modificado para manejar correctamente las salidas de turnos nocturnos
+exports.registerAttendance = async (req, res) => {
+  const { comment } = req.body;
+  let employeeRecords = [];
+  let shiftRecords = [];
+  const language = "en";
+  const TZ = APP_TZ;
+
+  function parseShiftDateTime(dateStr, timeStr) {
+    const t = String(timeStr).trim().toUpperCase();
+    if (t.includes("AM") || t.includes("PM")) {
+      return dayjs(`${dateStr} ${t}`, "YYYY-MM-DD hh:mm A", TZ);
+    }
+    if (/^\d{2}:\d{2}:\d{2}$/.test(t)) {
+      return dayjs(`${dateStr} ${t}`, "YYYY-MM-DD HH:mm:ss", TZ);
+    }
+    return dayjs(`${dateStr} ${t}`, "YYYY-MM-DD HH:mm", TZ);
+  }
+
+  function computeShiftWindow(
+    currentDateOnly,
+    shiftStartTimeStr,
+    shiftEndTimeStr
+  ) {
+    const TZ = "America/Tegucigalpa";
+    const startToday = parseShiftDateTime(currentDateOnly, shiftStartTimeStr);
+    const endToday = parseShiftDateTime(currentDateOnly, shiftEndTimeStr);
+
+    let start = startToday;
+    let end = endToday;
+    let crossesMidnight = false;
+
+    if (endToday.isBefore(startToday)) {
+      // Turno cruza medianoche
+      crossesMidnight = true;
+
+      const now = dayjs();
+      const endTodayWithGrace = endToday.add(1, "hour"); // 6:00 AM + 1h
+
+      if (now.isSameOrBefore(endTodayWithGrace)) {
+        // Madrugada (00:00–6:00) y hasta 7:00 AM => el turno que empezó AYER y termina HOY
+        start = startToday.subtract(1, "day"); // ayer 6:00 PM
+        end = endToday; // hoy 6:00 AM
+      } else {
+        // Ya pasó la gracia => el turno que empieza HOY y termina MAÑANA
+        start = startToday; // hoy 6:00 PM
+        end = endToday.add(1, "day"); // mañana 6:00 AM
+      }
+    }
+
+    return { start, end, crossesMidnight };
+  }
+
+  try {
+    const { employeeID, operationMode } = req.body;
+
+    if (!employeeID) {
+      return res
+        .status(400)
+        .json({ message: t("temployeeIDrequired", language) });
+    }
+
+    const currentDateTimeCST = dayjs();
+    const currentTimeSQL = currentDateTimeCST.format("YYYY-MM-DD hh:mm:ss A");
+    const currentDateOnly = currentDateTimeCST.format("YYYY-MM-DD");
+    const currentTimeFormatted = formatTimeWithPeriod(currentDateTimeCST);
+
+    let emitDateForSocket = currentDateOnly;
+
+    // Obtener detalles del empleado
+    [employeeRecords] = await db.query(
+      "SELECT firstName, middleName, lastName, photoUrl, shiftID, isActive FROM employees_emp WHERE employeeID = ?",
+      [employeeID]
+    );
+    if (employeeRecords.length === 0) {
+      return res.status(500).json({
+        message: t("employeedontFind", language),
+        statusType: "error",
+      });
+    }
+    const employee = employeeRecords[0];
+
+    if (employee.isActive === 0) {
+      const employeeNameInactive = `${employee.firstName}${employee.middleName ? " " + employee.middleName : ""
+        } ${employee.lastName}`;
+      const photoUrlInactive = employee.photoUrl || "";
+
+      return res.status(400).json({
+        message: t("employeeInactive", language),
+        statusType: "warning",
+        employeeName: employeeNameInactive,
+        photoUrl: photoUrlInactive,
+      });
+    }
+
+    const employeeName = `${employee.firstName}${employee.middleName ? " " + employee.middleName : ""
+      } ${employee.lastName}`;
+    const photoUrl = employee.photoUrl || "";
+    const shiftID = employee.shiftID;
+
+    // const today = dayjs();
+    const todayDay = getDayNameEnglish(currentDateOnly);
+
+    // const todayDay = removeAccents(
+    //   today.locale("es").format("dddd")
+    // ).toUpperCase();
+
+    const isSaturday = todayDay === "Saturday";
+
+    let shiftRow = null;
+    [shiftRecords] = await db.query(
+      "SELECT startTime, endTime, day FROM detailsshift_emp WHERE shiftID = ? AND day = ? LIMIT 1",
+      [shiftID, todayDay]
+    );
+
+    if (shiftRecords.length > 0) {
+      shiftRow = shiftRecords[0];
+    }
+
+    if (shiftRecords.length === 0) {
+      const pick = await pickUnclosedToClose(
+        db,
+        employeeID,
+        shiftID,
+        currentDateOnly
+      );
+
+      // Antes bloqueábamos; ahora solo lo ignoramos
+      if (pick && pick.tooOld) {
+        console.warn(
+          `[ATT] Pendiente antiguo ignorado (employee ${employeeID}): ${pick.record.date}`
+        );
+      }
+
+      // Si hay AYER, aplicas tu regla de salida (fin/gracia) como ya la tienes.
+      if (pick && !pick.tooOld && !pick.noShiftConfig) {
+        const { record, end, graceEnd } = pick;
+
+        if (currentDateTimeCST.isBefore(end)) {
+          return res.status(400).json({
+            message: `Tienes un turno nocturno en curso desde ${dayjs(
+              record.date
+            ).format("YYYY-MM-DD")}. Marca salida después de ${end.format(
+              "h:mm A"
+            )}.`,
+            employeeName,
+            photoUrl,
+          });
+        }
+
+        if (currentDateTimeCST.isAfter(graceEnd)) {
+        } else {
+          // Entre fin y gracia -> cerrar AYER con hora real (actual)
+          const exit12h = formatTimeWithPeriod(currentDateTimeCST);
+          const userID = getUserIdFromToken(req) || "1";
+          await db.query(
+            `UPDATE h_attendance_emp
+              SET exitTime = STR_TO_DATE(?, '%h:%i:%s %p'), updatedBy = ?
+              WHERE hattendanceID = ?`,
+            [exit12h, userID, record.hattendanceID]
+          );
+          const fullRecord = await getSingleAttendanceRecord(
+            employeeID,
+            record.date
+          );
+          if (fullRecord)
+            io.emit("newAttendanceRecord", {
+              type: "update_record",
+              record: fullRecord,
+            });
+
+          // >>> AGREGA ESTO ANTES DEL return:
+          setNightExitLock(employeeID, 10);
+
+          return res.status(201).json({
+            message: `Salida del turno del ${dayjs(record.date).format(
+              "YYYY-MM-DD"
+            )} registrada a ${exit12h}.`,
+            type: "exit_night_shift",
+            time: exit12h,
+            employeeID,
+            employeeName,
+            photoUrl,
+            attendanceID: record.hattendanceID,
+            isPermissionExit: false,
+            permissionExitTime: null,
+          });
+        }
+      }
+
+      // Si no hubo AYER (o había algo más viejo que estamos ignorando),
+      // mantén tu comportamiento por defecto de "hoy no tienes turno".
+      return res.status(400).json({
+        message: t("Donthaveshiftprogramming", language),
+        employeeName,
+        photoUrl,
+      });
+    }
+
+    let usedDateForWindow = currentDateOnly;
+    let usingYesterdayShift = false;
+
+    if (!shiftRow) {
+      // Sin turno ni hoy ni ayer
+      return res.status(400).json({
+        message: "No se encontró información del turno para este empleado.",
+        employeeName,
+        photoUrl,
+      });
+    }
+
+    const shiftStartTimeStr = shiftRow.startTime;
+    const shiftEndTimeStr = shiftRow.endTime;
+
+    const {
+      start: shiftStartTime,
+      end: shiftEndTime,
+      crossesMidnight: isNightShift,
+    } = computeShiftWindow(
+      usedDateForWindow,
+      shiftStartTimeStr,
+      shiftEndTimeStr
+    );
+
+    // 1) último registro de HOY
+    const [existingRecords] = await db.query(
+      `SELECT hattendanceID, entryTime, exitTime, date
+       FROM h_attendance_emp
+      WHERE employeeID = ? AND DATE(date) = ?
+     ORDER BY entryTime DESC LIMIT 1`,
+      [employeeID, currentDateOnly]
+    );
+
+    const latestRecord = existingRecords[0] || null;
+
+    // 2) ¿entrada o salida?
+    const isEntryAttempt = !latestRecord || latestRecord.exitTime !== null;
+
+    // 3) ¿tengo HOY un registro abierto?
+    const isCurrentRecordOpen = !!(
+      latestRecord && latestRecord.exitTime === null
+    );
+
+    if (isNightShift) {
+      let pick = await pickUnclosedToClose(
+        db,
+        employeeID,
+        shiftID,
+        currentDateOnly
+      );
+
+      if (pick && pick.tooOld) {
+        pick = null; // << clave: evita que más abajo uses end/graceEnd
+      }
+
+      // --- Caso: hay pendiente de AYER -> aplicar reglas de salida (fin/gracia)
+      if (pick && !pick.noShiftConfig) {
+        const { record, end, graceEnd } = pick;
+
+        if (currentDateTimeCST.isBefore(end)) {
+          return res.status(400).json({
+            message: `Tienes un turno nocturno en curso desde ${dayjs(
+              record.date
+            ).format("YYYY-MM-DD")}. Marca salida después de ${end.format(
+              "h:mm A"
+            )}.`,
+            employeeName,
+            photoUrl,
+          });
+        }
+
+        if (currentDateTimeCST.isAfter(graceEnd)) {
+        } else {
+          // Entre fin y gracia -> cerrar AYER con hora real (actual)
+          const exit12h = formatTimeWithPeriod(currentDateTimeCST);
+          const userID = getUserIdFromToken(req) || "1";
+          await db.query(
+            `UPDATE h_attendance_emp
+     SET exitTime = STR_TO_DATE(?, '%h:%i:%s %p'), updatedBy = ?
+     WHERE hattendanceID = ?`,
+            [exit12h, userID, record.hattendanceID]
+          );
+          const fullRecord = await getSingleAttendanceRecord(
+            employeeID,
+            record.date
+          );
+          if (fullRecord)
+            io.emit("newAttendanceRecord", {
+              type: "update_record",
+              record: fullRecord,
+            });
+
+          // >>> AGREGA ESTO ANTES DEL return:
+          setNightExitLock(employeeID, 10);
+
+          return res.status(201).json({
+            message: `Salida del turno del ${dayjs(record.date).format(
+              "YYYY-MM-DD"
+            )} registrada a ${exit12h}.`,
+            type: "exit_night_shift",
+            time: exit12h,
+            employeeID,
+            employeeName,
+            photoUrl,
+            attendanceID: record.hattendanceID,
+            isPermissionExit: false,
+            permissionExitTime: null,
+          });
+        }
+      }
+    }
+
+    const [finalizedCheck] = await db.query(
+      `SELECT h.exitTime, d.dispatchingID 
+         FROM h_attendance_emp h 
+         LEFT JOIN dispatching_emp d ON h.employeeID = d.employeeID AND DATE(h.date) = DATE(d.date)
+         WHERE h.employeeID = ? AND DATE(h.date) = ? 
+         ORDER BY h.entryTime DESC LIMIT 1`,
+      [employeeID, currentDateOnly]
+    );
+    if (
+      finalizedCheck.length > 0 &&
+      (finalizedCheck[0].exitTime !== null ||
+        finalizedCheck[0].dispatchingID !== null)
+    ) {
+      return res.status(400).json({
+        message:
+          "Ya has finalizado tu jornada laboral para hoy (Salida o Despacho registrado). No puedes realizar más marcajes.",
+        employeeName,
+        photoUrl,
+      });
+    }
+
+    const pendingReturnStatus = await checkPendingPermissionReturn(employeeID);
+    if (pendingReturnStatus.hasPendingReturn) {
+      if (operationMode === "DESPACHO") {
+        return res.status(400).json({
+          message:
+            "No puedes marcar despacho mientras estás fuera con permiso. Registra tu regreso primero.",
+          employeeName,
+          photoUrl,
+        });
+      } else if (operationMode !== "permission_entry") {
+        if (
+          !currentDateTimeCST.isAfter(shiftStartTime.subtract(1, "hour")) ||
+          !currentDateTimeCST.isBefore(shiftEndTime.add(1, "hour"))
+        ) {
+          return res.status(400).json({
+            message: `No se puede registrar entrada de regreso con permiso fuera del horario extendido del turno (${shiftStartTime
+              .subtract(1, "hour")
+              .format("h:mm A")} - ${shiftEndTime
+                .add(1, "hour")
+                .format("h:mm A")}).`,
+            employeeName,
+            photoUrl,
+          });
+        }
+        const updateResult = await updatePermissionRecordWithEntry(
+          pendingReturnStatus.permissionData.permissionID,
+          currentTimeSQL
+        );
+        if (!updateResult.success) {
+          throw new Error(
+            "No se pudo actualizar el registro de permiso para regreso: " +
+            (updateResult.error || "Error desconocido")
+          );
+        }
+        // Emitir el registro completo
+        const fullRecord = await getSingleAttendanceRecord(
+          employeeID,
+          currentDateOnly
+        );
+        if (fullRecord) {
+          io.emit("newAttendanceRecord", {
+            type: "update_record",
+            record: fullRecord,
+          });
+        }
+        return res.status(201).json({
+          message: "Entrada de regreso con permiso registrada exitosamente",
+          type: "permission_entry",
+          time: currentTimeFormatted,
+          employeeID,
+          employeeName,
+          photoUrl,
+          isPermissionEntry: true,
+          permissionEntryTime: currentTimeFormatted,
+        });
+      } else {
+        return res.status(400).json({
+          message:
+            "Debes registrar tu regreso del permiso antes de realizar cualquier otro marcaje.",
+          employeeName,
+          photoUrl,
+        });
+      }
+    }
+
+    // Manejar la operación de despacho
+    // Si el modo de operación es 'DESPACHO', delegar a la función interna de despacho.
+    if (operationMode === "DESPACHO") {
+      const employeeDetails = { employeeName, photoUrl };
+      // const shiftDetails = { shiftEndTimeStr };
+      return await registerDispatchingInternal(
+        req,
+        res,
+        employeeDetails
+        // shiftDetails
+      );
+    }
+
+    const [exceptionRows] = await db.query(
+      `
+  SELECT 
+    ex.exceptionTime, ds.endTime
+  FROM employees_emp e
+  LEFT JOIN exceptions_emp ex ON ex.exceptionID = e.exceptionID
+  LEFT JOIN shifts_emp s ON s.shiftID = e.shiftID
+  LEFT JOIN detailsshift_emp ds ON ds.shiftID = s.shiftID
+  WHERE e.employeeID = ? AND ds.day = ?
+  `,
+      [employeeID, todayDay]
+    );
+
+    let shiftEndTimeReal = null;
+    if (exceptionRows.length > 0) {
+      const { exceptionTime, endTime } = exceptionRows[0];
+      shiftEndTimeReal = dayjs(
+        `${currentDateOnly} ${endTime}`,
+        "YYYY-MM-DD HH:mm:ss"
+      );
+
+      if (exceptionTime > 0) {
+        shiftEndTimeReal = shiftEndTimeReal.subtract(exceptionTime, "minute");
+      }
+    } else {
+      // Si no se encuentran detalles de turno o excepciones específicas para el día actual,
+      // se utiliza la hora de fin de turno de detailsshift_emp, posiblemente ajustada para turno nocturno.
+      shiftEndTimeReal = shiftEndTime;
+    }
+
+    let registrationType = "";
+    let responseMessage = "";
+    let errorPrint = "";
+    let attendanceID = null;
+    let isPermissionExit = false;
+    let permissionExitTime = null;
+    let eventType = "";
+
+    // Obtener el ID de usuario del token para el registro de auditoría
+
+    const userID = getUserIdFromToken(req);
+
+    if (!isEntryAttempt && isNightShift && latestRecord) {
+      const latestRecordDate = dayjs(latestRecord.date).format("YYYY-MM-DD");
+      if (latestRecordDate === currentDateOnly) {
+        return res.status(400).json({
+          message: t(
+            ` ${t(`nightshiftscannotberecorded`)} ${shiftEndTime.format(
+              "h:mm A"
+            )}.`,
+            language
+          ),
+          employeeName,
+          photoUrl,
+        });
+      }
+    }
+
+    if (isNightShift && latestRecord) {
+      const latestRecordDate = dayjs(latestRecord.date).format("YYYY-MM-DD");
+
+      // Si el registro abierto es de AYER, entonces cerrarlo ahora
+      if (latestRecordDate !== currentDateOnly && !latestRecord.exitTime) {
+        const reachedEnd = !currentDateTimeCST.isBefore(shiftEndTime); // >= fin
+        const withinGrace = !currentDateTimeCST.isAfter(
+          shiftEndTime.add(1, "hour")
+        );
+
+        if (!reachedEnd) {
+          return res.status(400).json({
+            message: `Para turnos nocturnos, la salida se habilita a partir de ${shiftEndTime.format(
+              "h:mm A"
+            )}.`,
+            employeeName,
+            photoUrl,
+          });
+        }
+
+        if (!withinGrace) {
+        } else {
+          const query = `UPDATE h_attendance_emp
+                 SET exitTime = STR_TO_DATE(?, '%h:%i:%s %p'), updatedBy = ?
+                 WHERE hattendanceID = ?`;
+          await db.query(query, [
+            currentTimeFormatted,
+            userID || "1",
+            latestRecord.hattendanceID,
+          ]);
+
+          registrationType = "exit";
+          responseMessage = `Salida registrada exitosamente para turno iniciado el ${latestRecordDate}`;
+          attendanceID = latestRecord.hattendanceID;
+          eventType = "update_record";
+
+          emitDateForSocket = latestRecordDate;
+
+          const fullRecord = await getSingleAttendanceRecord(
+            employeeID,
+            latestRecordDate
+          );
+
+          setNightExitLock(employeeID, 10);
+
+          if (fullRecord)
+            io.emit("newAttendanceRecord", {
+              type: "update_record",
+              record: fullRecord,
+            });
+
+          return res.status(201).json({
+            message: responseMessage,
+            type: "exit_night_shift",
+            time: currentTimeFormatted,
+            employeeID,
+            employeeName,
+            photoUrl,
+            attendanceID,
+            isPermissionExit: false,
+            permissionExitTime: null,
+          });
+        }
+      }
+    }
+
+    if (isNightShift) {
+      const remain = remainingNightExitLock(employeeID);
+      if (remain > 0) {
+        return res.status(400).json({
+          message: `Acabas de registrar la salida del turno nocturno. Espera ${remain}s para volver a marcar la entrada.`,
+          employeeName,
+          photoUrl,
+        });
+      }
+    }
+
+    //LOGICA QUE PONE DE ENTRADA LOS PERMISOS TARDIDOS DE SOLICITUD
+    if (existingRecords.length === 0) {
+      let firstEntryTimeToUse = currentTimeFormatted;
+
+      // Traer el permiso SOLICITADO/APROBADO y activo para HOY, sin usar aún
+      const [permSched] = await db.query(
+        `SELECT permissionID, exitTimePermission, entryTimePermission
+       FROM permissionattendance_emp
+      WHERE employeeID = ?
+        AND DATE(date) = ?
+        AND isApproved = 1
+        AND status = 1
+        AND request = 1
+        AND exitPermission IS NULL
+        AND entryPermission IS NULL
+      ORDER BY permissionID DESC
+      LIMIT 1`,
+        [employeeID, currentDateOnly]
+      );
+
+      if (permSched.length > 0) {
+        // Ventana estimada del permiso (24h en DB)
+        const schedExit = dayjs(
+          `${currentDateOnly} ${permSched[0].exitTimePermission}`,
+          "YYYY-MM-DD HH:mm:ss"
+        );
+        const schedEntry = dayjs(
+          `${currentDateOnly} ${permSched[0].entryTimePermission}`,
+          "YYYY-MM-DD HH:mm:ss"
+        );
+
+        if (currentDateTimeCST.isBefore(schedExit)) {
+          // (B) Permiso aún NO inicia → NO tocar
+        } else if (currentDateTimeCST.isBefore(schedEntry)) {
+          // (A) Entrada dentro del rango de permiso → cerrar con 07:00 -> ahora
+          const shiftStart12h = formatTimeWithPeriod(shiftStartTime); // "07:00:00 AM"
+          const now12h = currentTimeFormatted;
+
+          const shiftStartSQL = `${currentDateOnly} ${shiftStart12h}`;
+          const nowSQL = `${currentDateOnly} ${now12h}`;
+
+          await db.query(
+            `UPDATE permissionattendance_emp
+            SET status = 0,
+                exitPermission  = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p'),
+                entryPermission = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p')
+          WHERE permissionID = ?`,
+            [shiftStartSQL, nowSQL, permSched[0].permissionID]
+          );
+
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "status",
+            value: 0,
+          });
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "exitPermission",
+            value: shiftStart12h,
+          });
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "entryPermission",
+            value: now12h,
+          });
+          io.emit("actualizar_permisos_tabla");
+          // La entrada del día se registra con la hora real del marcaje:
+          firstEntryTimeToUse = currentTimeFormatted;
+        } else {
+          // (C) LLEGÓ DESPUÉS de que terminó la ventana del permiso estimado
+          // Regla solicitada: NO usar horas estimadas; cerrar como "entrada tardía" 07:00 -> ahora
+          const shiftStart12h = formatTimeWithPeriod(shiftStartTime); // "07:00:00 AM"
+          const now12h = currentTimeFormatted;
+
+          const shiftStartSQL = `${currentDateOnly} ${shiftStart12h}`;
+          const nowSQL = `${currentDateOnly} ${now12h}`;
+
+          await db.query(
+            `UPDATE permissionattendance_emp
+            SET status = 0,
+                exitPermission  = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p'),
+                entryPermission = STR_TO_DATE(?, '%Y-%m-%d %h:%i:%s %p')
+          WHERE permissionID = ?`,
+            [shiftStartSQL, nowSQL, permSched[0].permissionID]
+          );
+
+          // Notificaciones al frontend
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "status",
+            value: 0,
+          });
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "exitPermission",
+            value: shiftStart12h,
+          });
+          io.emit("permission:updated", {
+            permissionID: permSched[0].permissionID,
+            field: "entryPermission",
+            value: now12h,
+          });
+          io.emit("actualizar_permisos_tabla");
+        }
+      }
+
+      // ************* NUEVA LÓGICA: SALIDA SIN ENTRADA (NOCTURNO) *************
+      const graceEndToday = shiftEndTimeReal.add(2, "hour");
+      const yesterdayStr = dayjs(currentDateOnly)
+        .subtract(1, "day")
+        .format("YYYY-MM-DD");
+
+      if (
+        isNightShift && // sólo aplica a turnos que cruzan medianoche
+        currentDateTimeCST.isSameOrAfter(shiftEndTimeReal) && // ya es >= fin de turno
+        currentDateTimeCST.isSameOrBefore(graceEndToday) // dentro de la gracia
+      ) {
+        // 0) Revisar si AYER ya tiene algo
+        const [yRows] = await db.query(
+          `SELECT hattendanceID,
+            entryTime,
+            exitTime,
+            DATE_FORMAT(date, '%Y-%m-%d') AS d
+       FROM h_attendance_emp
+      WHERE employeeID = ? AND DATE(date) = ?
+      ORDER BY COALESCE(entryTime, '0000-00-00 00:00:00') DESC, hattendanceID DESC
+      LIMIT 1`,
+          [employeeID, yesterdayStr]
+        );
+
+        // A) AYER YA ESTÁ CERRADO -> bloquear y orientar a ENTRADA DE HOY
+        if (yRows.length > 0 && yRows[0].exitTime !== null) {
+          setNightExitLock(employeeID, 10);
+          return res.status(400).json({
+            message: `Tu turno del ${yesterdayStr} ya está cerrado. Marca tu entrada de hoy.`,
+            employeeName,
+            photoUrl,
+          });
+        }
+
+        // B) AYER ESTÁ ABIERTO -> cerrar AYER con hora actual (UPDATE)
+        if (yRows.length > 0 && yRows[0].exitTime === null) {
+          const [upd] = await db.query(
+            `UPDATE h_attendance_emp
+          SET exitTime = STR_TO_DATE(?, '%h:%i:%s %p'), updatedBy = ?
+        WHERE hattendanceID = ?`,
+            [currentTimeFormatted, userID || "1", yRows[0].hattendanceID]
+          );
+
+          registrationType = "exit";
+          responseMessage = `Salida registrada para el día ${yesterdayStr} a las ${currentTimeFormatted}.`;
+          attendanceID = yRows[0].hattendanceID;
+          eventType = "update_record";
+
+          // Emite AYER y devuelve
+          emitDateForSocket = yesterdayStr;
+          setNightExitLock(employeeID, 10);
+
+          const fullRecord = await getSingleAttendanceRecord(
+            employeeID,
+            yesterdayStr
+          );
+          if (fullRecord) {
+            io.emit("newAttendanceRecord", {
+              type: eventType,
+              record: fullRecord,
+            });
+          }
+
+          return res.status(201).json({
+            message: responseMessage,
+            type: "exit_night_shift",
+            time: currentTimeFormatted,
+            employeeID,
+            employeeName,
+            photoUrl,
+            attendanceID,
+            isPermissionExit: false,
+            permissionExitTime: null,
+          });
+        }
+
+        // C) AYER NO TIENE NADA -> insertar salida-sin-entrada en AYER
+        const exitOnlyQuery = `
+    INSERT INTO h_attendance_emp (employeeID, entryTime, exitTime, date, createdDate, createdBy, updatedBy, comment)
+    VALUES (?, NULL, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)
+  `;
+        const [insExitOnly] = await db.query(exitOnlyQuery, [
+          employeeID,
+          currentTimeFormatted, // salida ahora (AM/PM)
+          yesterdayStr, // <<<<<< FECHA = AYER
+          dayjs().format("YYYY-MM-DD HH:mm:ss"), // createdDate = ahora
+          userID || "1",
+          userID || "1",
+          comment
+        ]);
+
+        registrationType = "exit_no_entry";
+        responseMessage = `Salida registrada (sin entrada) para el día ${yesterdayStr} a las ${currentTimeFormatted}.`;
+        attendanceID = insExitOnly.insertId;
+        eventType = "update_record";
+
+        // Evitar doble disparo inmediato y permitir que el siguiente marcaje sea la ENTRADA de HOY
+        setNightExitLock(employeeID, 10);
+        emitDateForSocket = yesterdayStr;
+
+        // Emitimos el registro de AYER
+        const fullRecord = await getSingleAttendanceRecord(
+          employeeID,
+          yesterdayStr
+        );
+        if (fullRecord) {
+          io.emit("newAttendanceRecord", {
+            type: eventType,
+            record: fullRecord,
+          });
+        }
+
+        return res.status(201).json({
+          message: responseMessage,
+          type: registrationType,
+          time: currentTimeFormatted,
+          employeeID,
+          employeeName,
+          photoUrl,
+          attendanceID,
+          isPermissionExit: false,
+          permissionExitTime: null,
+        });
+      }
+
+      // registrar SALIDA sin entrada para HOY y responder de inmediato.
+      if (
+        !isNightShift &&
+        currentDateTimeCST.isSameOrAfter(shiftEndTimeReal) &&
+        currentDateTimeCST.isSameOrBefore(shiftEndTimeReal.add(3, "hour"))
+      ) {
+        const userID = getUserIdFromToken?.(req) || "1";
+
+        const exitOnlyToday = `
+          INSERT INTO h_attendance_emp
+            (employeeID, entryTime, exitTime, date, createdDate, createdBy, updatedBy, comment)
+          VALUES
+            (?, NULL, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)
+        `;
+        const [insExitToday] = await db.query(exitOnlyToday, [
+          employeeID,
+          currentTimeFormatted, // "hh:mm:ss AM/PM"
+          currentDateOnly, // Fecha = HOY
+          dayjs().format("YYYY-MM-DD HH:mm:ss"), // createdDate = ahora
+          userID,
+          userID,
+          comment
+        ]);
+
+        registrationType = "exit_no_entry";
+        responseMessage = `Salida registrada (sin entrada) para el día ${currentDateOnly} a las ${currentTimeFormatted}.`;
+        attendanceID = insExitToday.insertId;
+        eventType = "update_record";
+
+        emitDateForSocket = currentDateOnly;
+        const fullRecord = await getSingleAttendanceRecord(
+          employeeID,
+          currentDateOnly
+        );
+        if (fullRecord) {
+          io.emit("newAttendanceRecord", {
+            type: eventType,
+            record: fullRecord,
+          });
+        }
+
+        return res.status(201).json({
+          message: responseMessage,
+          type: registrationType,
+          time: currentTimeFormatted,
+          employeeID,
+          employeeName,
+          photoUrl,
+          attendanceID,
+          isPermissionExit: false,
+          permissionExitTime: null,
+        });
+      }
+
+      const query = `INSERT INTO h_attendance_emp (employeeID, entryTime, date, createdDate, createdBy, updatedBy, comment) VALUES (?, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)`;
+      const [result] = await db.query(query, [
+        employeeID,
+        firstEntryTimeToUse,
+        currentDateOnly,
+        dayjs().format("YYYY-MM-DD HH:mm:ss"), // createdDate = ahora
+        userID || "1",
+        userID || "1",
+        comment
+      ]);
+
+      registrationType = "entry";
+      responseMessage = "Entrada registrada exitosamente";
+      attendanceID = result.insertId;
+      eventType = "new_entry";
+    } else {
+      eventType = "update_record";
+
+      // Manejar salidas con permiso
+      const permissionStatus = await checkActivePermission(employeeID);
+      if (
+        permissionStatus.hasActivePermission &&
+        !permissionStatus.hasExitedWithPermission
+      ) {
+        const [permissionDetails] = await db.query(
+          `SELECT exitTimePermission FROM permissionattendance_emp 
+           WHERE employeeID = ? AND date = ? AND isApproved = 1 AND exitPermission IS NULL`,
+          [employeeID, currentDateOnly]
+        );
+
+        const allowedExitTime = dayjs(
+          `${currentDateOnly} ${permissionDetails[0].exitTimePermission}`,
+          "YYYY-MM-DD HH:mm:ss"
+        );
+
+        if (currentDateTimeCST.isBefore(allowedExitTime)) {
+          return res.status(400).json({
+            message: `No puedes registrar la salida con permiso hasta las ${allowedExitTime.format(
+              "h:mm A"
+            )}.`,
+            employeeName,
+            photoUrl,
+          });
+        }
+        isPermissionExit = true;
+        permissionExitTime = currentTimeFormatted;
+        const updateResult = await updatePermissionRecordWithExit(
+          permissionStatus.permissionData.permissionID,
+          currentTimeSQL
+        );
+        if (!updateResult.success) {
+          throw new Error(
+            "No se pudo actualizar el registro de permiso para salida: " +
+            (updateResult.error || "Error desconocido")
+          );
+        }
+        registrationType = "permission_exit";
+        responseMessage = "Salida con permiso registrada exitosamente";
+        errorPrint = updateResult.errorPrint;
+        attendanceID = latestRecord.hattendanceID;
+      } else {
+        if (isCurrentRecordOpen) {
+          const graceEndToday = shiftEndTimeReal.add(3, "hour");
+
+          if (!isSaturday) {
+            // DÍAS NORMALES: mantener bloqueos
+            if (currentDateTimeCST.isBefore(shiftEndTimeReal)) {
+              return res.status(400).json({
+                message:
+                  t("notExitBefore", language) +
+                  " " +
+                  shiftEndTimeReal.format("h:mm A") +
+                  ".",
+                employeeName,
+                photoUrl,
+              });
+            }
+            if (currentDateTimeCST.isAfter(graceEndToday)) {
+              return res.status(400).json({
+                message: `El turno terminó a ${shiftEndTimeReal.format(
+                  "h:mm A"
+                )} y la gracia terminó a ${graceEndToday.format("h:mm A")}.`,
+                employeeName,
+                photoUrl,
+              });
+            }
+          }
+
+          // SÁBADO: pasa directo (sin bloqueos) | Otros días: si llegó aquí es válido
+          const query = `
+              UPDATE h_attendance_emp
+              SET exitTime = STR_TO_DATE(?, '%h:%i:%s %p'), updatedBy = ?
+              WHERE hattendanceID = ?
+  `;
+          const [result] = await db.query(query, [
+            currentTimeFormatted,
+            userID || "1",
+            latestRecord.hattendanceID,
+          ]);
+          if (result.affectedRows === 0) {
+            throw new Error(
+              "No se pudo actualizar el registro de asistencia para salida."
+            );
+          }
+          registrationType = "exit";
+          responseMessage = "Salida registrada exitosamente";
+          attendanceID = latestRecord.hattendanceID;
+        } else {
+          if (isNightShift) {
+            const remain = remainingNightExitLock(employeeID);
+            if (remain > 0) {
+              return res.status(400).json({
+                message: `Acabas de registrar la salida del turno nocturno. Espera ${remain}s para volver a marcar la entrada.`,
+                employeeName,
+                photoUrl,
+              });
+            }
+          }
+
+          const query = `INSERT INTO h_attendance_emp (employeeID, entryTime, date, createdDate, createdBy, updatedBy, comment) VALUES (?, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)`;
+          const [result] = await db.query(query, [
+            employeeID,
+            currentTimeFormatted,
+            currentDateOnly,
+            dayjs().format("YYYY-MM-DD HH:mm:ss"), // createdDate = ahora
+            userID || "1",
+            userID || "1",
+            comment || "",
+          ]);
+          registrationType = "entry";
+          responseMessage = "Entrada registrada exitosamente";
+          attendanceID = result.insertId;
+          eventType = "new_entry";
+        }
+      }
+    }
+
+    // Después de cualquier operación de asistencia exitosa (entrada, salida, permiso, despacho),
+    // emitir el registro actualizado a los clientes conectados a través de Socket.IO.
+    const fullRecord = await getSingleAttendanceRecord(
+      employeeID,
+      emitDateForSocket
+    );
+
+    if (fullRecord) {
+      io.emit("newAttendanceRecord", {
+        type: eventType,
+        record: fullRecord,
+      });
+    }
+
+    res.status(201).json({
+      message: responseMessage,
+      type: registrationType,
+      time: currentTimeFormatted,
+      employeeID,
+      employeeName,
+      photoUrl,
+      attendanceID,
+      isPermissionExit: isPermissionExit,
+      permissionExitTime: permissionExitTime,
+      errorPrint,
+    });
+  } catch (error) {
+    console.error("Error en registerAttendance:", error);
+    const employeeInfoForError =
+      employeeRecords && employeeRecords.length > 0
+        ? {
+          employeeName: `${employeeRecords[0].firstName}${employeeRecords[0].middleName
+            ? " " + employeeRecords[0].middleName
+            : ""
+            } ${employeeRecords[0].lastName}`,
+          photoUrl: employeeRecords[0].photoUrl || "",
+        }
+        : {};
+    res.status(500).json({
+      message: "Error interno del servidor al registrar la asistencia.",
+      ...employeeInfoForError,
+    });
+  }
+};
+
+exports.updateTimeAttendance = async (req, res) => {
+  const { hattendanceID, employeeID, date, field, newTime, supervisorID } =
+    req.body;
+
+  // 1) Validaciones básicas
+  const allowedFields = ["entryTime", "exitTime", "dispatchingTime"];
+  if (!allowedFields.includes(field)) {
+    return res.status(400).json({
+      message: "El campo especificado no es válido para la actualización.",
+    });
+  }
+
+  // El backend trabaja con "hh:mm:ss AM/PM"
+  const timeRegex =
+    /^([0-1]?[0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])\s?(AM|PM)$/i;
+  if (!timeRegex.test(newTime)) {
+    return res.status(400).json({
+      message: "El formato de hora debe ser hh:mm:ss AM/PM (ej. 02:02:00 PM).",
+    });
+  }
+
+  try {
+    const userID = getUserIdFromToken(req);
+    if (!userID) {
+      return res.status(401).json({
+        message: "Token de autenticación inválido o no proporcionado.",
+      });
+    }
+
+    // 2) RAMA ESPECIAL: DESPACHO (NO existe columna dispatchingTime en h_attendance_emp)
+    if (field === "dispatchingTime") {
+      // Necesitamos employeeID y date. Si no vinieron pero hay hattendanceID, los tomamos del registro.
+      let empId = employeeID;
+      let theDate = date;
+
+      if ((!empId || !theDate) && hattendanceID) {
+        const [attRow] = await db.query(
+          `SELECT employeeID, DATE(date) AS d
+             FROM h_attendance_emp
+            WHERE hattendanceID = ?`,
+          [hattendanceID]
+        );
+        if (attRow.length === 0) {
+          return res.status(404).json({
+            message:
+              "No se encontró el registro de asistencia para derivar employeeID y fecha.",
+          });
+        }
+        empId = empId || attRow[0].employeeID;
+        theDate = theDate || attRow[0].d;
+      }
+
+      if (!empId || !theDate) {
+        return res.status(400).json({
+          message:
+            "Para actualizar despacho, envía (employeeID y date) o un hattendanceID válido.",
+        });
+      }
+      //chatgtp lo hace solo (borrelo)
+      // Consultar si ya existe registro de despacho ese día
+      const [exists] = await db.query(
+        `SELECT dispatchingID, DATE_FORMAT(exitTimeComplete, '%h:%i:%s %p') AS currentDispatch
+           FROM dispatching_emp
+          WHERE employeeID = ? AND DATE(date) = ?
+          ORDER BY dispatchingID DESC
+          LIMIT 1`,
+        [empId, theDate]
+      );
+
+      let oldDispatch = exists.length
+        ? exists[0].currentDispatch || "Sin valor"
+        : "Sin valor";
+
+      if (exists.length) {
+        // Update
+        await db.query(
+          `UPDATE dispatching_emp
+              SET exitTimeComplete = STR_TO_DATE(?, '%h:%i:%s %p'),
+                  supervisorID = ?
+            WHERE dispatchingID = ?`,
+          [newTime, supervisorID || userID, exists[0].dispatchingID]
+        );
+      } else {
+        // Insert
+        await db.query(
+          `INSERT INTO dispatching_emp (employeeID, supervisorID, date, exitTimeComplete)
+           VALUES (?, ?, ?, STR_TO_DATE(?, '%h:%i:%s %p'))`,
+          [empId, supervisorID || userID, theDate, newTime]
+        );
+      }
+
+      // Emitir registro unificado para refrescar la fila del día en el frontend
+      await getSingleAttendanceRecord(empId, theDate);
+
+      return res.status(200).json({
+        success: true,
+        message: "Despacho actualizado correctamente.",
+        oldTime: oldDispatch,
+        newTime,
+      });
+    }
+
+    // 3) FLUJO NORMAL (entryTime / exitTime)
+    // 3A) Actualizar por hattendanceID si vino
+    if (hattendanceID) {
+      // Traer employeeID y date para emitir socket y para formatear oldTime
+      const [attendanceRecord] = await db.query(
+        `SELECT employeeID, date, DATE_FORMAT(${field}, '%h:%i:%s %p') AS currentTime
+           FROM h_attendance_emp
+          WHERE hattendanceID = ?`,
+        [hattendanceID]
+      );
+      if (attendanceRecord.length === 0) {
+        return res.status(404).json({
+          message: "No se encontró el registro de asistencia para actualizar.",
+        });
+      }
+      const { employeeID: emp, date: d, currentTime } = attendanceRecord[0];
+
+      // Actualizar conservando la fecha original del registro
+      const updateQuery = `
+        UPDATE h_attendance_emp
+           SET ${field} = STR_TO_DATE(CONCAT(DATE(date), ' ', ?), '%Y-%m-%d %h:%i:%s %p'),
+               updatedBy = ?
+         WHERE hattendanceID = ?`;
+      const [result] = await db.query(updateQuery, [
+        newTime,
+        userID,
+        hattendanceID,
+      ]);
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          message: "No se pudo actualizar el registro de asistencia.",
+        });
+      }
+
+      const fullRecord = await getSingleAttendanceRecord(emp, d);
+      if (fullRecord) {
+        io.emit("newAttendanceRecord", {
+          type: "update_record",
+          record: fullRecord,
+        });
+      }
+      return res.status(200).json({
+        success: true,
+        message: "Hora actualizada correctamente.",
+        oldTime: currentTime || "Sin valor",
+        newTime,
+      });
+    }
+
+    // 3B) Crear/actualizar por employeeID + date si NO vino hattendanceID
+    if (!employeeID || !date) {
+      return res.status(400).json({
+        message:
+          "Datos incompletos: proporcione hattendanceID o (employeeID y date).",
+      });
+    }
+
+    // ¿Existe ya para ese empleado/fecha?
+    const [rows] = await db.query(
+      `SELECT hattendanceID FROM h_attendance_emp
+        WHERE employeeID = ? AND DATE(date) = ? LIMIT 1`,
+      [employeeID, date]
+    );
+    let targetID = rows.length ? rows[0].hattendanceID : null;
+
+    if (!targetID) {
+      let comment = null;
+
+      // No existe: crear registro con el campo indicado
+      if (field === "entryTime") {
+        const [ins] = await db.query(
+          `INSERT INTO h_attendance_emp (employeeID, entryTime, date, createdDate, createdBy, updatedBy, comment)
+           VALUES (?, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)`,
+          [employeeID, newTime, date, dayjs().format("YYYY-MM-DD HH:mm:ss"), userID, userID, comment || ""]
+        );
+        targetID = ins.insertId;
+      } else {
+        const [ins] = await db.query(
+          `INSERT INTO h_attendance_emp (employeeID, exitTime, date, createdDate, createdBy, updatedBy, comment)
+           VALUES (?, STR_TO_DATE(?, '%h:%i:%s %p'), ?, ?, ?, ?, ?)`,
+          [employeeID, newTime, date, dayjs().format("YYYY-MM-DD HH:mm:ss"), userID, userID, comment || ""]
+        );
+        targetID = ins.insertId;
+      }
+
+      const fullRecord = await getSingleAttendanceRecord(employeeID, date);
+      if (fullRecord)
+        io.emit("newAttendanceRecord", {
+          type: "new_entry",
+          record: fullRecord,
+        });
+
+      return res.status(201).json({
+        success: true,
+        message: field === "entryTime" ? "Entrada creada." : "Salida creada.",
+        hattendanceID: targetID,
+      });
+    }
+
+    // Sí existe: actualizar ese campo conservando la fecha del registro
+    const updateExisting = `
+      UPDATE h_attendance_emp
+         SET ${field} = STR_TO_DATE(CONCAT(DATE(date), ' ', ?), '%Y-%m-%d %h:%i:%s %p'),
+             updatedBy = ?
+       WHERE hattendanceID = ?`;
+    const [upd] = await db.query(updateExisting, [newTime, userID, targetID]);
+    if (upd.affectedRows === 0) {
+      return res
+        .status(500)
+        .json({ message: "No se pudo actualizar el registro existente." });
+    }
+
+    const fullRecord = await getSingleAttendanceRecord(employeeID, date);
+
+    if (fullRecord)
+      io.emit("newAttendanceRecord", {
+        type: "update_record",
+        record: fullRecord,
+      });
+
+    return res.status(200).json({
+      success: true,
+      message: "Hora actualizada correctamente.",
+      hattendanceID: targetID,
+    });
+  } catch (error) {
+    console.error("Error en updateTimeAttendance:", error);
+    return res.status(500).json({
+      message:
+        "Error interno del servidor al actualizar/crear la hora: " +
+        error.message,
+    });
+  }
+};
+
+const getAttendanceRecords = async (employeeID, date, shiftID) => {
+  try {
+    if (shiftID === 1) {
+      // Turno 1
+      // Verificar si ya existe un registro de asistencia para hoy
+      const [existingRecords] = await db.query(
+        `
+      SELECT hattendanceID, date, entryTime, exitTime
+      FROM h_attendance_emp
+      WHERE employeeID = ? AND DATE(date) = ?
+      ORDER BY entryTime DESC
+      LIMIT 1
+      `,
+        [employeeID, dayjs().format("YYYY-MM-DD")]
+      );
+
+      return existingRecords;
+    } else if (shiftID === 2) {
+      // Turno 2
+      // Verificar si ya existe un registro de asistencia para hoy o ayer
+      const [existingRecords] = await db.query(
+        `
+      SELECT hattendanceID, entryTime, date, exitTime
+      FROM h_attendance_emp
+      WHERE employeeID = ? AND (DATE(date) = ? OR DATE(date) = ?)
+      ORDER BY date DESC, entryTime DESC
+    `,
+        [
+          employeeID,
+          dayjs().format("YYYY-MM-DD"),
+          dayjs().subtract(1, "day").format("YYYY-MM-DD"),
+        ]
+      );
+
+      return existingRecords;
+    } else {
+      // Sin turno asignado
+      const [existingRecords] = await db.query(
+        `
+      SELECT hattendanceID, date, entryTime, exitTime
+      FROM h_attendance_emp
+      WHERE employeeID = ? AND DATE(date) = ?
+      ORDER BY entryTime DESC
+      LIMIT 1
+      `,
+        [employeeID, dayjs().format("YYYY-MM-DD")]
+      );
+      return existingRecords;
+    }
+  } catch (error) {
+    console.error("Error en getAttendanceRecords:", error);
+    throw error;
+  }
+};
+
+exports.deleteAttendance = async (req, res) => {
+  const { hattendanceID } = req.params;
+
+  if (!hattendanceID) {
+    return res
+      .status(400)
+      .json({ message: "El ID de asistencia es requerido" });
+  }
+
+  try {
+    const [result] = await db.query(
+      `DELETE FROM h_attendance_emp WHERE hattendanceID = ?`,
+      [hattendanceID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res
+        .status(404)
+        .json({ message: "Registro de asistencia no encontrado" });
+    }
+
+    return res
+      .status(200)
+      .json({ message: "Registro de asistencia eliminado correctamente" });
+  } catch (error) {
+    console.error("Error en deleteAttendance:", error);
+    return res.status(500).json({
+      message:
+        "Error interno del servidor al eliminar el registro de asistencia: " +
+        error.message,
+    });
+  }
+};
+
+// exports.registerAttendanceNuevo = async (req, res) => {
+//   const { employeeID, despacho, supervisorID } = req.body;
+
+//   if (!employeeID) {
+//     return res.status(400).json({ message: "El ID del empleado es requerido" });
+//   }
+//   const currentDate = dayjs().format("YYYY-MM-DD");
+//   const currentTime = dayjs().format("HH:mm:ss");
+
+//   const [currentShift] = await db.query(
+//     `
+//         SELECT employeeID, codeEmployee, s.shiftID, isActive
+//         FROM pmsdev.employees_emp e
+//         inner join shifts_emp s on e.shiftID = s.shiftID
+//         where employeeID = ?
+//       `,
+//     [employeeID]
+//   );
+
+//   if (currentShift.length === 0) {
+//     return res.status(400).json({ message: "Empleado no encontrado" });
+//   }
+//   if (currentShift[0].isActive === 0) {
+//     return res.status(400).json({
+//       message: "El empleado está inactivo. No puede registrar marcaje.",
+//     });
+//   }
+
+//   // Dia a buscar, con turno de noche se busca el dia anterior tambien, solo si es antes de las 16:45
+//   console.log(dayjs().hour(), dayjs().minute());
+
+//   const stringDay =
+//     currentShift[0].shiftID === 2 &&
+//       dayjs().hour() < 16 &&
+//       dayjs().minute() < 45
+//       ? dayjs().subtract(1, "day").locale("es").format("dddd").toUpperCase()
+//       : dayjs().locale("es").format("dddd").toUpperCase();
+
+//   console.log(stringDay, currentDate, currentTime);
+
+//   const [employees] = await db.query(
+//     `
+//         SELECT employeeID, codeEmployee, s.shiftID, s.shiftName,
+//         CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName,
+//         dsh.startTime, dsh.endTime, dsh.day, isActive, ex.exceptionID,
+//         ex.exceptionName, ex.exceptionTime
+//         FROM pmsdev.employees_emp e
+//         inner join shifts_emp s on e.shiftID = s.shiftID
+//         inner join detailsshift_emp dsh on dsh.shiftID = s.shiftID
+//         inner join exceptions_emp ex on ex.exceptionID = e.exceptionID
+//         where employeeID = ? and dsh.day = ?
+//       `,
+//     [employeeID, stringDay]
+//   );
+
+//   // Si el empleado tiene turno pero no tiene startTime ni endTime (ejemplo: sábado sin horario definido)
+//   if (employees.length == 0) {
+//     const existingRecords = await getAttendanceRecords(
+//       employeeID,
+//       currentDate,
+//       null
+//     );
+//     // Si no hay registros, permite registrar entrada
+//     if (existingRecords.length === 0) {
+//       await db.query(
+//         `INSERT INTO h_attendance_emp(employeeID, entryTime, date, createdDate, createdBy)
+//           VALUES (?, ?, ?, ?, ?)`,
+//         [employeeID, currentTime, currentDate, ...camposAuditoriaADD(req)]
+//       );
+//       return res
+//         .status(200)
+//         .json({ message: "Entrada registrada (Tiempo extra)" });
+//     } else if (existingRecords.length > 0 && !existingRecords[0].exitTime) {
+//       // Si ya hay registros, verifica si la última entrada fue hace más de 1 hora
+//       // Busca la última entrada (entryTime) sin salida (exitTime)
+//       const ultimaEntrada = existingRecords.find(
+//         (rec) => rec.entryTime && !rec.exitTime
+//       );
+//       console.log("Última entrada sin salida:", ultimaEntrada);
+//       if (ultimaEntrada) {
+//         // Compara la hora de la última entrada con la hora actual
+//         const entradaMoment = dayjs(
+//           `${dayjs(ultimaEntrada.date).format("YYYY-MM-DD")} ${ultimaEntrada.entryTime
+//           }`
+//         );
+//         const ahoraMoment = dayjs(`${currentDate} ${currentTime}`);
+//         const diffHoras = ahoraMoment.diff(entradaMoment, "hour", true);
+//         console.log(
+//           `Diferencia en horas desde la última entrada: ${entradaMoment} ${ahoraMoment} ${diffHoras}`
+//         );
+
+//         // Si ya paso una hora desde la última entrada, deberia de marcarle su salida, actualizando el regitro de la última entrada
+//         if (diffHoras >= 1) {
+//           // Actualiza entrada
+//           await db.query(
+//             `
+//             UPDATE h_attendance_emp
+//             SET exitTime = ?, updatedDate = ?, updatedBy = ?
+//             WHERE hattendanceID = ?`,
+//             [
+//               currentTime,
+//               ...camposAuditoriaUPDATE(req),
+//               ultimaEntrada.hattendanceID,
+//             ]
+//           );
+//           return res.status(200).json({ message: "Salida registrada" });
+//         } else {
+//           return res.status(400).json({
+//             message:
+//               "Ya tienes una entrada registrada recientemente. Debe pasar al menos 1 hora para volver a marcar.",
+//           });
+//         }
+//       } else {
+//         // Si no hay entrada abierta, permite registrar
+//         await db.query(
+//           `INSERT INTO h_attendance_emp(employeeID, entryTime, date, createdDate, createdBy)
+//             VALUES (?, ?, ?, ?, ?)`,
+//           [employeeID, currentTime, currentDate, ...camposAuditoriaADD(req)]
+//         );
+//         return res
+//           .status(200)
+//           .json({ message: "Entrada registrada (Tiempo extra)" });
+//       }
+//     } else if (existingRecords.length > 0) {
+//       // Si ya hay un registro y entrada y salida estan registras no debe permitir registrar
+//       return res.status(400).json({
+//         message: "Ya tienes una entrada y salida registrada para hoy.",
+//       });
+//     }
+//   }
+
+//   // Turnos
+//   // 1 7:00 am - 16:45 pm
+//   // 2 6:00 pm - 6:00 am  (noche)
+
+//   // Extraer informacion del turno del empleado
+//   const {
+//     startTime,
+//     endTime,
+//     shiftID,
+//     exceptionName,
+//     exceptionTime,
+//     fullName,
+//   } = employees[0];
+
+//   if (employees.length === 0) {
+//     return res.status(400).json({ message: "Empleado no encontrado" });
+//   }
+
+//   if (employees[0].isActive === 0) {
+//     return res.status(400).json({
+//       message: "El empleado está inactivo. No puede registrar marcaje.",
+//     });
+//   }
+
+//   // Calcular los límites para marcaje de entrada anticipada (60 minutos antes del inicio) para turno nocturno
+//   let startTimeMoment = dayjs(`${currentDate} ${startTime}`);
+//   let endTimeMoment = dayjs(`${currentDate} ${endTime}`).add(1, "day");
+//   let currentTimeMoment = dayjs(`${currentDate} ${currentTime}`);
+//   let entradaAnticipada = startTimeMoment.subtract(60, "minute");
+
+//   console.log(
+//     startTimeMoment.format("YYYY-MM-DD HH:mm:ss"),
+//     endTimeMoment.format("YYYY-MM-DD HH:mm:ss"),
+//     currentTimeMoment.format("YYYY-MM-DD HH:mm:ss"),
+//     entradaAnticipada.format("YYYY-MM-DD HH:mm:ss")
+//   );
+
+//   // Si es turno nocturno, la hora de fin es del día siguiente
+//   if (shiftID === 2) {
+//     // Si la hora actual es menor al inicio, considerar que estamos después de medianoche
+//     if (currentTimeMoment.isBefore(startTimeMoment)) {
+//       currentTimeMoment = currentTimeMoment.add(1, "day");
+//     }
+//   }
+
+//   // Lógica especial para turno nocturno
+//   if (shiftID === 2) {
+//     // Si marca entre 60 minutos antes del inicio y antes de la hora de fin (del día siguiente): ENTRADA
+//     console.log(
+//       currentTimeMoment.format("YYYY-DD-MM HH:mm:ss"),
+//       entradaAnticipada.format("YYYY-DD-MM HH:mm:ss"),
+//       endTimeMoment.format("YYYY-DD-MM HH:mm:ss")
+//     );
+
+//     if (
+//       currentTimeMoment.isSameOrAfter(entradaAnticipada) &&
+//       currentTimeMoment.isBefore(endTimeMoment)
+//     ) {
+//       // Registrar entrada para el día actual
+//       // Calcular la fecha de inicio real del turno nocturno
+//       let turnoDate = dayjs().format("YYYY-MM-DD");
+//       // Si la hora actual es después de medianoche pero antes de la hora de fin, la entrada corresponde al día anterior
+//       console.log(
+//         dayjs(currentTimeMoment).format("YYYY-MM-DD HH:mm:ss"),
+//         dayjs(startTimeMoment).format("YYYY-MM-DD HH:mm:ss"),
+//         currentTimeMoment.isAfter(startTimeMoment)
+//       );
+
+//       if (currentTimeMoment.isAfter(startTimeMoment) === false) {
+//         turnoDate = dayjs().subtract(1, "day").format("YYYY-MM-DD");
+//       }
+
+//       const existingRecords = await getAttendanceRecords(
+//         employeeID,
+//         turnoDate,
+//         shiftID
+//       );
+//       // Si ya existe una entrada para la fecha de inicio del turno (entryTime no nulo y exitTime nulo), no crear otra
+//       // Revisar si ya existe alguna entrada sin salida para la fecha de inicio del turno
+//       console.log(existingRecords);
+//       console.log(turnoDate);
+
+//       const entradaAbierta = existingRecords.find(
+//         (rec) =>
+//           dayjs(rec.date).isSame(turnoDate, "day") &&
+//           rec.entryTime &&
+//           !rec.exitTime
+//       );
+//       console.log("Entrada abierta:", entradaAbierta);
+
+//       if (entradaAbierta) {
+//         return res.status(400).json({
+//           message: `Ya tienes una entrada registrada, tu turno termina a las ${endTimeMoment.format(
+//             "HH:mm a"
+//           )}.`,
+//         });
+//       } else {
+//         await db.query(
+//           `INSERT INTO h_attendance_emp(employeeID, entryTime, date, createdDate, createdBy)
+//             VALUES (?, ?, ?, ?, ?)`,
+//           [employeeID, currentTime, turnoDate, ...camposAuditoriaADD(req)]
+//         );
+//         return res
+//           .status(200)
+//           .json({ message: "Entrada registrada (turno nocturno)" });
+//       }
+//     }
+//     // Si marca después de la hora de fin (del día siguiente): SALIDA
+//     else if (
+//       currentTimeMoment.isSameOrAfter(endTimeMoment) &&
+//       currentTimeMoment.isBefore(startTimeMoment.subtract(3, "hour"))
+//     ) {
+//       // Buscar registro de entrada del día anterior
+//       const yesterday = dayjs().subtract(1, "day").format("YYYY-MM-DD");
+//       const existingRecords = await getAttendanceRecords(
+//         employeeID,
+//         yesterday,
+//         shiftID
+//       );
+
+//       console.log("Registros existentes para ayer:", existingRecords);
+
+//       if (existingRecords.length > 0 && !existingRecords[0].exitTime) {
+//         await db.query(
+//           `UPDATE h_attendance_emp
+//             SET exitTime = ?, updatedDate = ?, updatedBy = ?
+//             WHERE hattendanceID = ?`,
+//           [
+//             currentTime,
+//             ...camposAuditoriaUPDATE(req),
+//             existingRecords[0].hattendanceID,
+//           ]
+//         );
+//         return res
+//           .status(200)
+//           .json({ message: "Salida registrada (turno nocturno)" });
+//       }
+//       // Si ya existe un registro de entrada y salida para ayer (no debería pasar) y mandar mensaje que ya tiene salida
+//       else if (existingRecords.length > 0 && existingRecords[0].exitTime) {
+//         return res.status(200).json({ message: "Su turno ha terminado." });
+//       } // Si no hay registro de entrada para ayer, puede registrar salida sin entrada
+//       else {
+//         await db.query(
+//           `INSERT INTO h_attendance_emp(employeeID, exitTime, date, createdDate, createdBy)
+//             VALUES (?, ?, ?, ?, ?)`,
+//           [employeeID, currentTime, yesterday, ...camposAuditoriaADD(req)]
+//         );
+//         return res
+//           .status(200)
+//           .json({ message: "Salida registrada (sin entrada, turno nocturno)" });
+//       }
+//     } else {
+//       return res.status(400).json({
+//         message: "No puedes registrar marcaje en este momento",
+//       });
+//     }
+//   }
+
+//   console.log(
+//     "Turno nocturno:",
+//     shiftID,
+//     "Entrada anticipada desde:",
+//     entradaAnticipada.format("YYYY-MM-DD HH:mm:ss"),
+//     "Inicio:",
+//     startTimeMoment.format("YYYY-MM-DD HH:mm:ss"),
+//     "Fin:",
+//     endTimeMoment.format("YYYY-MM-DD HH:mm:ss"),
+//     "Actual:",
+//     currentTimeMoment.format("YYYY-MM-DD HH:mm:ss")
+//   );
+
+//   console.log(startTime, endTime, currentTime, exceptionName, exceptionTime);
+
+//   //Revisar si el empleado tiene un permiso aprobado para hoy
+//   const [permissionActivo] = await db.query(
+//     `
+//       SELECT * FROM permissionattendance_emp
+//       WHERE date = ? AND employeeID = ?
+//       AND isApproved = 1 AND status = 1 AND request = 1
+//       ORDER BY permissionID DESC
+//       LIMIT 1
+//       `,
+//     [dayjs().format("YYYY-MM-DD"), employeeID]
+//   );
+
+//   // Revisar si hay permiso en uso
+//   const [permissionInUse] = await db.query(
+//     `
+//       SELECT * FROM permissionattendance_emp
+//       WHERE date = ? AND employeeID = ?
+//       AND isApproved = 1 AND exitPermission
+//       AND isNull(entryPermission) AND request = 1
+//       ORDER BY permissionID DESC
+//       LIMIT 1;
+//       `,
+//     [dayjs().format("YYYY-MM-DD"), employeeID]
+//   );
+
+//   // Logica si es modo despacho
+//   if (despacho && shiftID !== 2) {
+//     // Validar si no tiene una salida de despacho registrada para hoy
+//     const [existingDispatch] = await db.query(
+//       `
+//       SELECT * FROM dispatching_emp
+//       WHERE date = ? AND employeeID = ?
+//       `,
+//       [dayjs().format("YYYY-MM-DD"), employeeID]
+//     );
+
+//     if (existingDispatch.length > 0) {
+//       return res.status(400).json({
+//         message: "Ya tienes una salida de despacho registrada para hoy.",
+//       });
+//     }
+
+//     // Escribir en la tabla de despacho
+//     await db.query(
+//       `
+//      INSERT INTO dispatching_emp(employeeID, supervisorID, date, exitTimeComplete, comment)
+//       VALUES (?, ?, ?, ?, ?)
+//       `,
+//       [
+//         employeeID,
+//         supervisorID,
+//         dayjs().format("YYYY-MM-DD"),
+//         currentTime,
+//         true,
+//       ]
+//     );
+
+//     // Actualizar el registro de asistencia con la hora de salida
+//     // Primero verificar si ya tiene un registro de asistencia para hoy
+//     const existingRecords = await getAttendanceRecords(
+//       employeeID,
+//       dayjs().format("YYYY-MM-DD"),
+//       shiftID
+//     );
+//     if (existingRecords.length > 0) {
+//       // Actualizar el registro existente con la hora de salida
+//       await db.query(
+//         `
+//         UPDATE h_attendance_emp
+//         SET exitTime = ?, updatedDate = ?, updatedBy = ?
+//         WHERE hattendanceID = ?
+//       `,
+//         [
+//           endTime,
+//           ...camposAuditoriaUPDATE(req),
+//           existingRecords[0].hattendanceID,
+//         ]
+//       );
+//     } else {
+//       // Si no hay registro, crear uno nuevo con la hora de salida (sin entrada)
+//       await db.query(
+//         `
+//         INSERT INTO h_attendance_emp(employeeID, exitTime, date, createdDate, createdBy)
+//         VALUES (?, ?, ?, ?, ?)
+//       `,
+//         [
+//           employeeID,
+//           endTime,
+//           dayjs().format("YYYY-MM-DD"),
+//           ...camposAuditoriaADD(req),
+//         ]
+//       );
+//     }
+
+//     return res.status(200).json({ message: "Despacho registrado" });
+//   }
+
+//   // Validad salidas permitidas antes de mi hora de salida
+//   // Puedo salir si:
+//   // 1. Tengo un permiso aprobado para hoy
+//   // 2. Estoy dentro del rango de tiempo del permiso (si es que tiene hora de salida)
+//   // 3. La hora actual es mayor a mi hora de salida del turno menos el tiempo de excepción (si aplica)
+//   // 4. Si despacho es true, puedo salir en cualquier momento
+
+//   let endTimeEmployee = dayjs(`${currentDate} ${endTime}`)
+//     .subtract(exceptionTime, "minute")
+//     .format("HH:mm:ss")
+//     .toString();
+
+//   console.log(
+//     "Hora actual",
+//     currentTime,
+//     "Salida turno",
+//     endTime,
+//     "Entrada turno",
+//     startTime,
+//     "Excepción (min)",
+//     exceptionTime,
+//     endTimeEmployee
+//   );
+
+//   if (currentTime < endTimeEmployee && !despacho && shiftID !== 2) {
+//     // Ingresar entrada normal pero validando el turno, segun el turno, ya que un turno
+//     // puede iniciar un dia y terminar al otro dia
+//     console.log("Validando turno para entrada o salida anticipada");
+
+//     const existingRecords = await getAttendanceRecords(
+//       employeeID,
+//       dayjs().format("YYYY-MM-DD"),
+//       shiftID
+//     );
+//     if (existingRecords.length === 0) {
+//       // No hay registros, ingresar entrada
+//       await db.query(
+//         `
+//           INSERT INTO h_attendance_emp(employeeID, entryTime, date, createdDate, createdBy)
+//           VALUES (?, ?, ?, ?, ?)
+//       `,
+//         [
+//           employeeID,
+//           currentTime,
+//           dayjs().format("YYYY-MM-DD"),
+//           ...camposAuditoriaADD(req),
+//         ]
+//       );
+
+//       // Actualizar el registro de permiso si hay permisos menores a la hora de entrada
+//       if (permissionActivo.length > 0) {
+//         if (currentTime > permissionActivo[0].exitTimePermission) {
+//           await db.query(
+//             `
+//             UPDATE permissionattendance_emp
+//             SET exitPermission = ?, entryPermission = ?, status = 0, updatedDate = ?, updatedBy = ?
+//             WHERE permissionID = ?
+//           `,
+//             [
+//               startTime,
+//               currentTime,
+//               ...camposAuditoriaUPDATE(req),
+//               permissionActivo[0].permissionID,
+//             ]
+//           );
+//         }
+//       }
+
+//       return res
+//         .status(200)
+//         .json({ message: `Entrada registrada para ${fullName}` });
+//     }
+
+//     if (permissionActivo.length > 0) {
+//       // Validar si hay un permiso menor a la hora actual
+//       if (currentTime < permissionActivo[0].exitTimePermission) {
+//         return res.status(400).json({
+//           message: `No puedes registrar la salida con permiso hasta las ${permissionActivo[0].exitTimePermission}.`,
+//         });
+//       } else {
+//         // Actualizar el registro de permiso con la hora de salida
+//         await db.query(
+//           `
+//         UPDATE permissionattendance_emp
+//         SET exitPermission = ?, status = 0, updatedDate = ?, updatedBy = ?
+//         WHERE permissionID = ?
+//         `,
+//           [
+//             currentTime,
+//             ...camposAuditoriaUPDATE(req),
+//             permissionActivo[0].permissionID,
+//           ]
+//         );
+//         return res
+//           .status(200)
+//           .json({ message: "Salida del permiso registrada" });
+//       }
+//     }
+
+//     // Validar si tengo un permiso en uso (ya salí con permiso pero no he regresado) y no he registrado mi regreso
+//     if (permissionInUse.length > 0) {
+//       // Actualizar el registro de permiso con la hora de salida
+//       await db.query(
+//         `
+//       UPDATE permissionattendance_emp
+//       SET entryPermission = ?
+//       WHERE permissionID = ?
+//       `,
+//         [currentTime, permissionInUse[0].permissionID]
+//       );
+//       return res.status(200).json({
+//         message: "Entrada del permiso registrada",
+//       });
+//     }
+
+//     // Validar si ya tiene una entrada registrada para hoy y tampoco permiso activo o en uso
+//     if (
+//       existingRecords.length > 0 &&
+//       permissionActivo.length === 0 &&
+//       permissionInUse.length === 0
+//     ) {
+//       // Ya tiene una entrada, no puede registrar salida antes de la hora de salida del turno
+//       return res.status(400).json({
+//         message: `No puedes registrar la salida antes de las ${endTime}.`,
+//       });
+//     }
+//   } else if (currentTime >= endTimeEmployee && !despacho && shiftID !== 2) {
+//     // Puede registrar salida
+//     console.log("Puede registrar salida");
+
+//     const existingRecords = await getAttendanceRecords(
+//       employeeID,
+//       dayjs().format("YYYY-MM-DD"),
+//       shiftID
+//     );
+
+//     // No hay registros, ingresar salida (sin entrada)
+//     if (existingRecords.length === 0) {
+//       await db.query(
+//         `
+//           INSERT INTO h_attendance_emp(employeeID, exitTime, date, createdDate, createdBy)
+//           VALUES (?, ?, ?, ?, ?)
+//       `,
+//         [
+//           employeeID,
+//           currentTime,
+//           dayjs().format("YYYY-MM-DD"),
+//           ...camposAuditoriaADD(req),
+//         ]
+//       );
+//       return res.status(200).json({ message: "Salida registrada" });
+//     }
+//     if (existingRecords[0].exitTime) {
+//       return res
+//         .status(400)
+//         .json({ message: "Ya tienes una salida registrada para hoy." });
+//     }
+//     // Actualizar el registro existente con la hora de salida
+//     await db.query(
+//       `
+//       UPDATE h_attendance_emp
+//       SET exitTime = ?, updatedDate = ?, updatedBy = ?
+//       WHERE employeeID = ? AND date = ?
+//       `,
+//       [
+//         currentTime,
+//         ...camposAuditoriaUPDATE(req),
+//         employeeID,
+//         dayjs().format("YYYY-MM-DD"),
+//       ]
+//     );
+//     return res.status(200).json({ message: "Salida registrada" });
+//   }
+
+//   return res.status(200).json({ message: "Función en desarrollo" });
+// };
+
+// Controlador para obtener el turno actual de un empleado
+exports.getCurrentShiftDate = async (req, res) => {
+  const { date } = req.params;
+
+  if (!date) {
+    return res
+      .status(400)
+      .json({ message: "Fecha inválida o no proporcionada" });
+  }
+  let currentTime = dayjs().format("HH:mm:ss");
+
+  const [shiftDetail] = await db.query(
+    `
+        SELECT
+          s.shiftID, ds.day, s.shiftName, ds.startTime, ds.endTime
+        FROM detailsshift_emp ds
+        INNER JOIN shifts_emp s ON ds.shiftID = s.shiftID
+        WHERE s.companyID = 1
+          AND ds.day = '${dayjs(date)
+      .locale("en")
+      .format("dddd")}'
+          AND (
+          (ds.startTime < ds.endTime AND '${currentTime}' BETWEEN ds.startTime AND ds.endTime)
+          OR
+          (ds.startTime > ds.endTime AND
+          ('${currentTime}' >= ds.startTime OR '${currentTime}' <= ds.endTime))
+        )
+      `
+  );
+  if (shiftDetail.length === 0) {
+    return res
+      .status(200)
+      .json({ message: "No hay turno activo actualmente", currentShift: null });
+  }
+  return res.status(200).json({ currentShift: shiftDetail[0] || null });
+};
+
+// Obtener llegaadas tardías de los empleado por fecha
+exports.getLateAttendance = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const { date, option } = req.query;
+  if (!date) {
+    return res
+      .status(400)
+      .json({ message: "Fecha inválida o no proporcionada" });
+  }
+  try {
+    const [lateArrivals] = await db.query(
+      ` 
+            SELECT 
+            h.hattendanceID, h.date, h.entryTime, 
+            e.employeeID, e.codeEmployee, concat(firstName, " ", middleName, " ", lastName) fullName,
+            j.jobName, s.sectorName, ds.startTime, ds.endTime
+            FROM h_attendance_emp h
+            INNER JOIN employees_emp e ON e.employeeID = h.employeeID
+            INNER JOIN shifts_emp sh on sh.shiftID = e.shiftID
+			      INNER JOIN detailsshift_emp ds on ds.shiftID = sh.shiftID
+            INNER JOIN jobs_emp j on j.jobID = e.jobID
+            INNER JOIN sectors_emp s ON s.sectorID = e.sectorID
+            WHERE h.date = ? AND ds.day = '${capitalizar(dayjs(date).locale("en").format("dddd"))}'
+            AND h.entryTime > '07:00:59' AND e.requiredAttendance = 1 AND e.isActive = 1 AND e.shiftID = 1
+            AND NOT EXISTS (
+                SELECT 1
+                FROM permissionattendance_emp p
+                WHERE p.employeeID = h.employeeID
+                  AND p.date = h.date
+            )
+            ORDER BY h.entryTime ASC;
+      `, [date || dayjs().format("YYYY-MM-DD")]
+    );
+
+
+    return res.status(200).json({ lateArrivals });
+  } catch (error) {
+    console.error("Error en getLateArrivals:", error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+const normalizeRange = ({ nummWeek, startDate, endDate }) => {
+  let start, end;
+
+  if (startDate && endDate) {
+    start = dayjs(startDate).format("YYYY-MM-DD");
+    end = dayjs(endDate).format("YYYY-MM-DD");
+    return { startDate: start, endDate: end };
+  }
+
+  if (!nummWeek) return null;
+
+  start = dayjs().isoWeek(nummWeek).startOf("isoWeek").format("YYYY-MM-DD");
+  const weekEnd = dayjs().isoWeek(nummWeek).startOf("isoWeek").add(4, "day").format("YYYY-MM-DD");
+  const today = dayjs().format("YYYY-MM-DD");
+  end = dayjs(weekEnd).isAfter(today) ? today : weekEnd;
+
+  return { startDate: start, endDate: end };
+};
+
+// exports.exportAbsenceReport = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//     const { nummWeek } = req.query;
+
+//     // ===== Rango de fecha de la semana (L-V) =====
+//     let startDate, endDate;
+
+//     if (nummWeek) {
+//       startDate = dayjs()
+//         .isoWeek(nummWeek)
+//         .startOf("isoWeek")
+//         .format("YYYY-MM-DD");
+
+//       // Calcular el final de la semana (viernes)
+//       let weekEndDate = dayjs()
+//         .isoWeek(nummWeek)
+//         .startOf("isoWeek")
+//         .add(4, 'day') // Viernes
+//         .format("YYYY-MM-DD");
+
+//       // Si la fecha de fin es mayor a hoy, usar hoy como fecha de fin
+//       const today = dayjs().format("YYYY-MM-DD");
+//       endDate = dayjs(weekEndDate).isAfter(today) ? today : weekEndDate;
+//     } else {
+//       return res.status(400).json({
+//         message: "Debe proporcionar nummWeek o startDate y endDate"
+//       });
+//     }
+
+//     // Query para obtener empleados sin asistencia en el rango de fechas
+//     const [absentEmployees] = await db.query(
+//       `
+//         CALL sp_getAbsenceEmployees('${startDate}', '${endDate}');
+//       `
+//     );
+
+//     if (!absentEmployees[0] || absentEmployees[0].length === 0) {
+//       return res.status(200).json({
+//         message: "No hay datos de ausencias para el rango de fechas especificado"
+//       });
+//     }
+
+//     // ===== GENERAR ARRAY DE FECHAS =====
+//     const start = dayjs(startDate);
+//     const end = dayjs(endDate);
+//     const dates = [];
+//     let current = start;
+//     while (current.isSameOrBefore(end)) {
+//       dates.push(current.format("YYYY-MM-DD"));
+//       current = current.add(1, "day");
+//     }
+
+//     // ===== AGRUPAR DATOS POR EMPLEADO =====
+//     // Estructura: { employeeID: { fullName, areaName, datos: { date: status, ... } } }
+//     const employeesMap = new Map();
+
+//     for (const record of absentEmployees[0]) {
+//       const empId = record.employeeID;
+//       const dateStr = dayjs(record.work_date).format("YYYY-MM-DD");
+
+//       if (!employeesMap.has(empId)) {
+//         employeesMap.set(empId, {
+//           employeeID: empId,
+//           fullName: record.fullName || "",
+//           areaName: record.areaName || "",
+//           datos: {}
+//         });
+//       }
+
+//       const emp = employeesMap.get(empId);
+//       emp.datos[dateStr] = record.status || "SIN DATOS";
+//     }
+
+//     // ===== CREAR EXCEL =====
+//     const ExcelJS = require("exceljs");
+//     const workbook = new ExcelJS.Workbook();
+//     const ws = workbook.addWorksheet("Ausencias");
+
+//     // Colores por status
+//     const statusColors = {
+//       "AUSENTE SIN PERMISO": "FFC7CE", // Rojo
+//       "PERMISO": "FFEB9C", // Amarillo
+//       "INCAPACIDAD": "BDD7EE", // Azul claro
+//       "VACACIONES": "C6E0B4", // Verde claro
+//       "MATERNIDAD": "E2EFDA", // Verde muy claro
+//       "LICENCIA": "F4CCCC", // Rojo claro
+//       "SIN DATOS": "E7E6E6" // Gris
+//     };
+
+//     // ===== HEADER CON FECHAS =====
+//     const headerRow = ["ID", "Empleado", "Área"];
+//     for (const date of dates) {
+//       const dayName = dayjs(date).locale("es").format("ddd"); // lun, mar, mié, etc
+//       headerRow.push(`${date}\n${dayName}`);
+//     }
+
+//     ws.addRow(headerRow);
+
+//     // Aplicar estilos al header
+//     const headerRowNum = ws.rowCount;
+//     for (let col = 1; col <= headerRow.length; col++) {
+//       const cell = ws.getCell(headerRowNum, col);
+//       cell.font = {
+//         bold: true,
+//         color: { argb: "FFFFFF" },
+//         size: 11
+//       };
+//       cell.fill = {
+//         type: "pattern",
+//         pattern: "solid",
+//         fgColor: { argb: "4472C4" } // Azul
+//       };
+//       cell.alignment = {
+//         horizontal: "center",
+//         vertical: "center",
+//         wrapText: true
+//       };
+//       cell.border = {
+//         top: { style: "thin" },
+//         bottom: { style: "thin" },
+//         left: { style: "thin" },
+//         right: { style: "thin" }
+//       };
+//     }
+
+//     // ===== DATOS DE EMPLEADOS =====
+//     const employees = Array.from(employeesMap.values()).sort((a, b) => a.employeeID - b.employeeID);
+
+//     for (const employee of employees) {
+//       const row = [
+//         employee.employeeID,
+//         employee.fullName,
+//         employee.areaName
+//       ];
+
+//       // Agregar datos por cada fecha
+//       for (const date of dates) {
+//         const status = employee.datos[date] || "";
+//         row.push(status);
+//       }
+
+//       const dataRowNum = ws.addRow(row).number;
+
+//       // Aplicar estilos a datos
+//       for (let col = 1; col <= row.length; col++) {
+//         const cell = ws.getCell(dataRowNum, col);
+//         const value = cell.value;
+
+//         cell.alignment = {
+//           horizontal: "center",
+//           vertical: "center"
+//         };
+//         cell.border = {
+//           top: { style: "thin" },
+//           bottom: { style: "thin" },
+//           left: { style: "thin" },
+//           right: { style: "thin" }
+//         };
+//         cell.font = { size: 10 };
+
+//         // Aplicar color según status
+//         if (value && statusColors[value]) {
+//           cell.fill = {
+//             type: "pattern",
+//             pattern: "solid",
+//             fgColor: { argb: statusColors[value] }
+//           };
+//         }
+//       }
+//     }
+
+//     // ===== ANCHO DE COLUMNAS =====
+//     ws.getColumn(1).width = 10; // ID
+//     ws.getColumn(2).width = 30; // Empleado
+//     ws.getColumn(3).width = 18; // Área
+//     for (let i = 4; i <= headerRow.length; i++) {
+//       ws.getColumn(i).width = 16; // Fechas
+//     }
+
+//     // ===== FROZEN PANES =====
+//     ws.views = [
+//       {
+//         xSplit: 3, // Congela 3 columnas (ID, Empleado, Área)
+//         ySplit: 1, // Congela 1 fila (header)
+//         topLeftCell: "D2",
+//         activeCell: "D2",
+//         state: "frozen"
+//       }
+//     ];
+
+//     // ===== ENVIAR ARCHIVO =====
+//     const buffer = await workbook.xlsx.writeBuffer();
+//     const filename = `ausencias_${startDate}_a_${endDate}.xlsx`;
+
+//     res.setHeader(
+//       "Content-Disposition",
+//       `attachment; filename="${filename}"`
+//     );
+//     res.setHeader(
+//       "Content-Type",
+//       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+//     );
+//     res.send(buffer);
+//   } catch (error) {
+//     console.error("Error en exportAbsenceReport:", error);
+//     res.status(500).json({
+//       message: t("getError", language),
+//       error: error.message
+//     });
+//   }
+// };
+
+// exports.exportAbsenceReport = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+
+//   try {
+//     const { nummWeek, startDate: qStart, endDate: qEnd } = req.query;
+
+//     // ===== Rango de fechas =====
+//     let startDate, endDate;
+
+//     const todayStr = dayjs().format("YYYY-MM-DD");
+
+//     // 1) Si viene por semana, mantener tu lógica EXACTA
+//     if (nummWeek) {
+//       startDate = dayjs()
+//         .isoWeek(Number(nummWeek))
+//         .startOf("isoWeek")
+//         .format("YYYY-MM-DD");
+
+//       const weekEndDate = dayjs()
+//         .isoWeek(Number(nummWeek))
+//         .startOf("isoWeek")
+//         .add(4, "day") // viernes
+//         .format("YYYY-MM-DD");
+
+//       endDate = dayjs(weekEndDate).isAfter(todayStr) ? todayStr : weekEndDate;
+//     }
+//     // 2) Nuevo: si viene por rango startDate/endDate
+//     else if (qStart && qEnd) {
+//       if (!dayjs(qStart, "YYYY-MM-DD", true).isValid() || !dayjs(qEnd, "YYYY-MM-DD", true).isValid()) {
+//         return res.status(400).json({ message: "Formato inválido. Use YYYY-MM-DD." });
+//       }
+
+//       startDate = dayjs(qStart).format("YYYY-MM-DD");
+//       endDate = dayjs(qEnd).format("YYYY-MM-DD");
+
+//       // si mandan endDate futura, recortar a hoy (igual que antes)
+//       if (dayjs(endDate).isAfter(todayStr)) endDate = todayStr;
+
+//       // si vienen invertidas, intercambiar (o podés retornar 400 si preferís)
+//       if (dayjs(startDate).isAfter(endDate)) {
+//         const tmp = startDate;
+//         startDate = endDate;
+//         endDate = tmp;
+//       }
+//     } else {
+//       return res.status(400).json({
+//         message: "Debe proporcionar nummWeek o startDate y endDate",
+//       });
+//     }
+
+//     // Query para obtener empleados sin asistencia en el rango de fechas
+//     const [absentEmployees] = await db.query(
+//       `CALL sp_getAbsenceEmployees('${startDate}', '${endDate}');`
+//     );
+
+//     if (!absentEmployees[0] || absentEmployees[0].length === 0) {
+//       return res.status(200).json({
+//         message: "No hay datos de ausencias para el rango de fechas especificado",
+//       });
+//     }
+
+//     // ===== GENERAR ARRAY DE FECHAS (mantener lógica L-V) =====
+//     const start = dayjs(startDate);
+//     const end = dayjs(endDate);
+//     const dates = [];
+
+//     let current = start;
+//     while (current.isSameOrBefore(end)) {
+//       const dow = current.day(); // 0 dom, 6 sáb
+//       // Mantener como semana laboral (L-V)
+//       if (dow !== 0 && dow !== 6) {
+//         dates.push(current.format("YYYY-MM-DD"));
+//       }
+//       current = current.add(1, "day");
+//     }
+
+//     // ===== AGRUPAR DATOS POR EMPLEADO (igual) =====
+//     const employeesMap = new Map();
+
+//     for (const record of absentEmployees[0]) {
+//       const empId = record.employeeID;
+//       const dateStr = dayjs(record.work_date).format("YYYY-MM-DD");
+
+//       if (!employeesMap.has(empId)) {
+//         employeesMap.set(empId, {
+//           employeeID: empId,
+//           fullName: record.fullName || "",
+//           areaName: record.areaName || "",
+//           datos: {},
+//         });
+//       }
+
+//       const emp = employeesMap.get(empId);
+//       emp.datos[dateStr] = record.status || "SIN DATOS";
+//     }
+
+//     // ===== EXCEL (TODO igual a tu código) =====
+//     const ExcelJS = require("exceljs");
+//     const workbook = new ExcelJS.Workbook();
+//     const ws = workbook.addWorksheet("Ausencias");
+
+//     const statusColors = {
+//       "AUSENTE SIN PERMISO": "FFC7CE",
+//       "PERMISO": "FFEB9C",
+//       "INCAPACIDAD": "BDD7EE",
+//       "VACACIONES": "C6E0B4",
+//       "MATERNIDAD": "E2EFDA",
+//       "LICENCIA": "F4CCCC",
+//       "SIN DATOS": "E7E6E6",
+//     };
+
+//     const headerRow = ["ID", "Empleado", "Área"];
+//     for (const date of dates) {
+//       const dayName = dayjs(date).locale("es").format("ddd");
+//       headerRow.push(`${date}\n${dayName}`);
+//     }
+
+//     ws.addRow(headerRow);
+
+//     const headerRowNum = ws.rowCount;
+//     for (let col = 1; col <= headerRow.length; col++) {
+//       const cell = ws.getCell(headerRowNum, col);
+//       cell.font = { bold: true, color: { argb: "FFFFFF" }, size: 11 };
+//       cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "4472C4" } };
+//       cell.alignment = { horizontal: "center", vertical: "center", wrapText: true };
+//       cell.border = {
+//         top: { style: "thin" }, bottom: { style: "thin" },
+//         left: { style: "thin" }, right: { style: "thin" },
+//       };
+//     }
+
+//     const employees = Array.from(employeesMap.values()).sort((a, b) => a.employeeID - b.employeeID);
+
+//     for (const employee of employees) {
+//       const row = [employee.employeeID, employee.fullName, employee.areaName];
+
+//       for (const date of dates) {
+//         const status = employee.datos[date] || "";
+//         row.push(status);
+//       }
+
+//       const dataRowNum = ws.addRow(row).number;
+
+//       for (let col = 1; col <= row.length; col++) {
+//         const cell = ws.getCell(dataRowNum, col);
+//         const value = cell.value;
+
+//         cell.alignment = { horizontal: "center", vertical: "center" };
+//         cell.border = {
+//           top: { style: "thin" }, bottom: { style: "thin" },
+//           left: { style: "thin" }, right: { style: "thin" },
+//         };
+//         cell.font = { size: 10 };
+
+//         if (value && statusColors[value]) {
+//           cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: statusColors[value] } };
+//         }
+//       }
+//     }
+
+//     ws.getColumn(1).width = 10;
+//     ws.getColumn(2).width = 30;
+//     ws.getColumn(3).width = 18;
+//     for (let i = 4; i <= headerRow.length; i++) ws.getColumn(i).width = 16;
+
+//     ws.views = [{ xSplit: 3, ySplit: 1, topLeftCell: "D2", activeCell: "D2", state: "frozen" }];
+
+//     const buffer = await workbook.xlsx.writeBuffer();
+//     const filename = `ausencias_${startDate}_a_${endDate}.xlsx`;
+
+//     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+//     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+//     res.send(buffer);
+//   } catch (error) {
+//     console.error("Error en exportAbsenceReport:", error);
+//     res.status(500).json({ message: t("getError", language), error: error.message });
+//   }
+// };
+
+exports.exportAbsenceReport = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { nummWeek, startDate: qStart, endDate: qEnd, status } = req.query;
+
+    // ✅ filtro para exportar por tipo
+    const filterStatusRaw = (status || "TODOS").toString().trim().toUpperCase();
+    const filterStatus = filterStatusRaw === "" ? "TODOS" : filterStatusRaw;
+    const mustFilter = filterStatus !== "TODOS";
+
+    // ===== Rango de fechas =====
+    let startDate, endDate;
+
+    const todayStr = dayjs().format("YYYY-MM-DD");
+
+    // 1) Semana (igual que antes)
+    if (nummWeek) {
+      startDate = dayjs()
+        .isoWeek(Number(nummWeek))
+        .startOf("isoWeek")
+        .format("YYYY-MM-DD");
+
+      const weekEndDate = dayjs()
+        .isoWeek(Number(nummWeek))
+        .startOf("isoWeek")
+        .add(4, "day") // viernes
+        .format("YYYY-MM-DD");
+
+      endDate = dayjs(weekEndDate).isAfter(todayStr) ? todayStr : weekEndDate;
+    }
+    // 2) Rango startDate/endDate (igual que antes)
+    else if (qStart && qEnd) {
+      if (
+        !dayjs(qStart, "YYYY-MM-DD", true).isValid() ||
+        !dayjs(qEnd, "YYYY-MM-DD", true).isValid()
+      ) {
+        return res.status(400).json({ message: "Formato inválido. Use YYYY-MM-DD." });
+      }
+
+      startDate = dayjs(qStart).format("YYYY-MM-DD");
+      endDate = dayjs(qEnd).format("YYYY-MM-DD");
+
+      if (dayjs(endDate).isAfter(todayStr)) endDate = todayStr;
+
+      if (dayjs(startDate).isAfter(endDate)) {
+        const tmp = startDate;
+        startDate = endDate;
+        endDate = tmp;
+      }
+    } else {
+      return res.status(400).json({
+        message: "Debe proporcionar nummWeek o startDate y endDate",
+      });
+    }
+
+    // Query para obtener empleados sin asistencia en el rango de fechas
+    const [absentEmployees] = await db.query(
+      `CALL sp_getAbsenceEmployees('${startDate}', '${endDate}');`
+    );
+
+    let rows = absentEmployees?.[0] || [];
+
+    if (!rows.length) {
+      return res.status(200).json({
+        message: "No hay datos de ausencias para el rango de fechas especificado",
+      });
+    }
+
+    // ============================================================
+    // ✅ NUEVO: FILTRO POR HIRE DATE (evitar ausencias antes de entrar)
+    // ============================================================
+    const ids = Array.from(new Set(rows.map((r) => r.employeeID).filter(Boolean)));
+
+    // ✅ NUEVO: traer también payrollType / planilla
+    let payrollMap = new Map();
+
+    if (ids.length) {
+      const [emps] = await db.query(
+        `
+        SELECT 
+          e.employeeID,
+          e.hireDate,
+          pay.payrollName AS payrollTypeName
+        FROM employees_emp e
+        LEFT JOIN payrolltype_emp pay
+          ON pay.payrollTypeID = e.payrollTypeID
+        WHERE e.employeeID IN (?);
+        `,
+        [ids]
+      );
+
+      const hireMap = new Map(
+        emps.map((e) => [
+          e.employeeID,
+          e.hireDate ? dayjs(e.hireDate).format("YYYY-MM-DD") : null,
+        ])
+      );
+
+      payrollMap = new Map(emps.map((e) => [e.employeeID, e.payrollTypeName || ""]));
+
+      rows = rows.filter((r) => {
+        const hd = hireMap.get(r.employeeID);
+        if (!hd) return true; // si no hay hireDate, no filtramos
+
+        const work = dayjs(r.work_date).format("YYYY-MM-DD");
+        return dayjs(work).isSameOrAfter(hd, "day"); // ✅ solo desde hireDate
+      });
+    }
+
+    // Si después del filtro por hireDate no quedan filas:
+    if (!rows.length) {
+      return res.status(200).json({
+        message: "No hay datos de ausencias válidos (según hireDate) en el rango indicado",
+      });
+    }
+
+    // ===== GENERAR ARRAY DE FECHAS (mantener lógica L-V) =====
+    const start = dayjs(startDate);
+    const end = dayjs(endDate);
+    const dates = [];
+
+    let current = start;
+    while (current.isSameOrBefore(end)) {
+      const dow = current.day(); // 0 dom, 6 sáb
+      if (dow !== 0 && dow !== 6) {
+        dates.push(current.format("YYYY-MM-DD"));
+      }
+      current = current.add(1, "day");
+    }
+
+    // ===== AGRUPAR DATOS POR EMPLEADO =====
+    const employeesMap = new Map();
+
+    for (const record of rows) {
+      const empId = record.employeeID;
+      const dateStr = dayjs(record.work_date).format("YYYY-MM-DD");
+
+      if (!employeesMap.has(empId)) {
+        employeesMap.set(empId, {
+          employeeID: empId,
+          fullName: record.fullName || "",
+          areaName: record.areaName || "",
+          payrollTypeName: payrollMap.get(empId) || "", // ✅ NUEVO
+          datos: {},
+        });
+      }
+
+      const emp = employeesMap.get(empId);
+
+      const recStatus = (record.status || "SIN DATOS").toString().trim().toUpperCase();
+
+      if (!mustFilter) {
+        emp.datos[dateStr] = record.status || "SIN DATOS";
+      } else {
+        if (recStatus === filterStatus) {
+          emp.datos[dateStr] = record.status || "SIN DATOS";
+        }
+      }
+    }
+
+    // ===== EXCEL (igual a tu código) =====
+    const ExcelJS = require("exceljs");
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet("Ausencias");
+
+    const statusColors = {
+      "AUSENTE SIN PERMISO": "FFC7CE",
+      PERMISO: "FFEB9C",
+      INCAPACIDAD: "BDD7EE",
+      VACACIONES: "C6E0B4",
+      MATERNIDAD: "E2EFDA",
+      LICENCIA: "F4CCCC",
+      "SIN DATOS": "E7E6E6",
+    };
+
+    // ✅ NUEVO: columna Planilla
+    const headerRow = ["ID", "Empleado", "Área", "Planilla"];
+    for (const date of dates) {
+      const dayName = dayjs(date).locale("es").format("ddd");
+      headerRow.push(`${date}\n${dayName}`);
+    }
+
+    ws.addRow(headerRow);
+
+    const headerRowNum = ws.rowCount;
+    for (let col = 1; col <= headerRow.length; col++) {
+      const cell = ws.getCell(headerRowNum, col);
+      cell.font = { bold: true, color: { argb: "FFFFFF" }, size: 11 };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "4472C4" } };
+      cell.alignment = { horizontal: "center", vertical: "center", wrapText: true };
+      cell.border = {
+        top: { style: "thin" },
+        bottom: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+
+    // ✅ limpiar empleados vacíos (por hireDate o por filtro status)
+    let employees = Array.from(employeesMap.values()).sort((a, b) => a.employeeID - b.employeeID);
+    employees = employees.filter((emp) => Object.keys(emp.datos || {}).length > 0);
+
+    for (const employee of employees) {
+      // ✅ NUEVO: meter Planilla en el row
+      const row = [employee.employeeID, employee.fullName, employee.areaName, employee.payrollTypeName];
+
+      for (const date of dates) {
+        const statusValue = employee.datos[date] || "";
+        row.push(statusValue);
+      }
+
+      const dataRowNum = ws.addRow(row).number;
+
+      for (let col = 1; col <= row.length; col++) {
+        const cell = ws.getCell(dataRowNum, col);
+        const value = cell.value;
+
+        cell.alignment = { horizontal: "center", vertical: "center" };
+        cell.border = {
+          top: { style: "thin" },
+          bottom: { style: "thin" },
+          left: { style: "thin" },
+          right: { style: "thin" },
+        };
+        cell.font = { size: 10 };
+
+        if (value && statusColors[value]) {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: statusColors[value] },
+          };
+        }
+      }
+    }
+
+    ws.getColumn(1).width = 10;  // ID
+    ws.getColumn(2).width = 30;  // Empleado
+    ws.getColumn(3).width = 18;  // Área
+    ws.getColumn(4).width = 16;  // Planilla
+
+    // fechas ahora empiezan en col 5
+    for (let i = 5; i <= headerRow.length; i++) ws.getColumn(i).width = 16;
+
+    ws.views = [{ xSplit: 4, ySplit: 1, topLeftCell: "E2", activeCell: "E2", state: "frozen" }];
+
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    const filename = mustFilter
+      ? `ausencias_${filterStatus.replace(/\s+/g, "_")}_${startDate}_a_${endDate}.xlsx`
+      : `ausencias_${startDate}_a_${endDate}.xlsx`;
+
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.send(buffer);
+  } catch (error) {
+    console.error("Error en exportAbsenceReport:", error);
+    res.status(500).json({
+      message: typeof t === "function" ? t("getError", language) : "Error al exportar",
+      error: error.message,
+    });
+  }
+};
+
+// exports.getAbsencesByRange = async (req, res) => {
+//   const language = req.headers["accept-language"] || "es";
+//   try {
+//     const { startDate, endDate } = req.query;
+
+//     if (!startDate || !endDate) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Debe proporcionar startDate y endDate",
+//       });
+//     }
+
+
+//     const today = dayjs().format("YYYY-MM-DD");
+//     const safeEndDate = dayjs(endDate).isAfter(today) ? today : endDate;
+
+
+//     const [result] = await db.query(`CALL sp_getAbsenceEmployees(?, ?);`, [
+//       startDate,
+//       safeEndDate,
+//     ]);
+
+//     const rows = result?.[0] || [];
+
+//     return res.status(200).json({
+//       success: true,
+//       data: rows, 
+//       meta: { startDate, endDate: safeEndDate },
+//     });
+//   } catch (error) {
+//     console.error("Error en getAbsencesByRange:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: t ? t("getError", language) : "Error al obtener datos",
+//       error: error.message,
+//     });
+//   }
+// };
+
+exports.getAbsencesByRange = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  try {
+    const { startDate, endDate, excludeNight } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Debe proporcionar startDate y endDate",
+      });
+    }
+
+    const today = dayjs().format("YYYY-MM-DD");
+    const safeEndDate = dayjs(endDate).isAfter(today) ? today : endDate;
+
+    const [result] = await db.query(`CALL sp_getAbsenceEmployees(?, ?);`, [
+      startDate,
+      safeEndDate,
+    ]);
+
+    let rows = result?.[0] || [];
+
+    // ✅ IMPORTANTE: por defecto NO excluir noche
+    const mustExcludeNight = String(excludeNight ?? "0") === "1";
+
+    if (rows.length) {
+      const ids = Array.from(new Set(rows.map((r) => r.employeeID).filter(Boolean)));
+
+      if (ids.length) {
+        // ✅ Traemos shiftID y hireDate
+        const [emps] = await db.query(
+          `SELECT employeeID, shiftID, hireDate FROM employees_emp WHERE employeeID IN (?);`,
+          [ids]
+        );
+
+        const shiftMap = new Map(emps.map((e) => [e.employeeID, e.shiftID]));
+        const hireMap = new Map(
+          emps.map((e) => [
+            e.employeeID,
+            e.hireDate ? dayjs(e.hireDate).format("YYYY-MM-DD") : null,
+          ])
+        );
+
+        // ✅ 1) Quitar noches si aplica
+        if (mustExcludeNight) {
+          const NIGHT_SHIFT_IDS = new Set([2]);
+          rows = rows.filter((r) => !NIGHT_SHIFT_IDS.has(shiftMap.get(r.employeeID)));
+        }
+
+        // ✅ 2) Quitar registros ANTES de hireDate
+        rows = rows.filter((r) => {
+          const hd = hireMap.get(r.employeeID);
+          if (!hd) return true; // si no hay hireDate, no filtramos
+
+          const work = dayjs(r.work_date).format("YYYY-MM-DD");
+          return dayjs(work).isSameOrAfter(hd, "day"); // solo desde hireDate
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: rows,
+      meta: {
+        startDate,
+        endDate: safeEndDate,
+        excludeNight: mustExcludeNight ? 1 : 0,
+      },
+    });
+  } catch (error) {
+    console.error("Error en getAbsencesByRange:", error);
+    return res.status(500).json({
+      success: false,
+      message: typeof t === "function" ? t("getError", language) : "Error al obtener datos",
+      error: error.message,
+    });
+  }
+};
+
+// exports.exportLateAttendanceReport = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//     const { nummWeek, startDate, endDate } = req.query;
+
+//     const range = normalizeRange({ nummWeek, startDate, endDate });
+//     if (!range) {
+//       return res.status(400).json({ message: "Debe proporcionar nummWeek o startDate y endDate" });
+//     }
+
+//     const { startDate: S, endDate: E } = range;
+
+//     const [lateAttendance] = await db.query(
+//       `
+//       SELECT 
+//         e.codeEmployee,
+//         CONCAT(e.firstName,' ',COALESCE(e.middleName,''),' ',e.lastName) AS fullName,
+//         DATE_FORMAT(a.date, '%Y-%m-%d') AS date,
+//         DATE_FORMAT(a.entryTime, '%H:%i:%s') AS entryTime,
+//         pt.permissionTypeName,
+//         p.comment
+//       FROM h_attendance_emp a
+//       INNER JOIN employees_emp e ON e.employeeID = a.employeeID
+//       LEFT JOIN permissionattendance_emp p 
+//         ON p.employeeID = a.employeeID 
+//         AND p.date = a.date 
+//         AND p.isApproved = 1
+//       LEFT JOIN permissiontype_emp pt ON pt.permissionTypeID = p.permissionTypeID
+//       WHERE a.date BETWEEN ? AND ?
+//         AND a.entryTime > '07:00:59'
+//         AND e.requiredAttendance = 1
+//         AND e.isActive = 1
+//         AND e.shiftID = 1
+//       ORDER BY a.date, e.codeEmployee;
+//       `,
+//       [S, E]
+//     );
+
+//     const workbook = new ExcelJS.Workbook();
+//     const worksheet = workbook.addWorksheet("Llegadas Tardías");
+
+//     const headers = ["Código", "Nombre", "Fecha", "Hora Entrada", "Tipo Permiso", "Comentario"];
+//     const headerRow = worksheet.addRow(headers);
+
+//     headerRow.eachCell((cell) => {
+//       cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//       cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+//       cell.alignment = { vertical: "middle", horizontal: "center" };
+//       cell.border = {
+//         top: { style: "thin" }, left: { style: "thin" },
+//         bottom: { style: "thin" }, right: { style: "thin" },
+//       };
+//     });
+
+//     lateAttendance.forEach((r) => {
+//       const row = [
+//         r.codeEmployee,
+//         r.fullName,
+//         r.date,
+//         r.entryTime,
+//         r.permissionTypeName || "",
+//         r.comment || "",
+//       ];
+
+
+//       const dataRow = worksheet.addRow(row);
+//       dataRow.eachCell((cell) => {
+//         cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+//         cell.border = {
+//           top: { style: "thin" }, left: { style: "thin" },
+//           bottom: { style: "thin" }, right: { style: "thin" },
+//         };
+//       });
+//     });
+
+//     worksheet.columns = [
+//       { width: 12 }, // Código
+//       { width: 35 }, // Nombre
+//       { width: 12 }, // Fecha
+//       { width: 15 }, // Hora
+//       { width: 20 }, // Tipo permiso
+//       { width: 45 }, // Comentario
+//     ];
+
+//     const fileName =
+//       startDate && endDate
+//         ? `Reporte_Llegadas_Tardias_${S}_a_${E}.xlsx`
+//         : `Reporte_Llegadas_Tardias_Week_${nummWeek}.xlsx`;
+
+//     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+//     res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
+
+//     await workbook.xlsx.write(res);
+//     res.end();
+//   } catch (error) {
+//     console.error("Error en exportLateAttendanceReport:", error);
+//     res.status(500).json({ message: t("getError", language) });
+//   }
+// };
+
+exports.exportLateAttendanceReport = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { nummWeek, startDate, endDate, permissionFilter } = req.query;
+
+    const range = normalizeRange({ nummWeek, startDate, endDate });
+    if (!range) {
+      return res.status(400).json({
+        message: "Debe proporcionar nummWeek o startDate y endDate",
+      });
+    }
+
+    const { startDate: S, endDate: E } = range;
+
+    const pfRaw = String(permissionFilter ?? "all").toLowerCase();
+    const pf = pfRaw === "with" || pfRaw === "without" ? pfRaw : "all";
+
+    const [rows] = await db.query(
+      `
+      WITH RECURSIVE date_range AS (
+        SELECT DATE(?) AS work_date
+        UNION ALL
+        SELECT DATE_ADD(work_date, INTERVAL 1 DAY)
+        FROM date_range
+        WHERE work_date < DATE(?)
+      )
+      SELECT 
+        e.employeeID,
+        e.codeEmployee,
+        CONCAT(e.firstName,' ',COALESCE(e.middleName,''),' ',e.lastName) AS fullName,
+        area.areaName,
+
+        pay.payrollName AS payrollTypeName,
+
+        d.work_date,
+
+        a.date AS attendanceDate,
+        a.entryTime,
+        ds.startTime AS shiftStartTime,
+        ds.endTime   AS shiftEndTime,
+
+        p.permissionID,
+        pt.permissionTypeName,
+        p.comment,
+
+        (
+          CASE
+            WHEN ds.startTime <= ds.endTime THEN
+              TIME_TO_SEC(a.entryTime) - TIME_TO_SEC(ds.startTime)
+            WHEN a.date = d.work_date THEN
+              TIME_TO_SEC(a.entryTime) - TIME_TO_SEC(ds.startTime)
+            ELSE
+              (TIME_TO_SEC(a.entryTime) + 86400) - TIME_TO_SEC(ds.startTime)
+          END
+        ) AS lateSeconds
+
+      FROM employees_emp e
+      INNER JOIN area_emp area ON area.areaID = e.areaID
+
+      LEFT JOIN payrolltype_emp pay
+        ON pay.payrollTypeID = e.payrollTypeID
+
+      CROSS JOIN date_range d
+
+      INNER JOIN detailsshift_emp ds
+        ON ds.shiftID = e.shiftID
+        AND ds.day = CASE WEEKDAY(d.work_date)
+          WHEN 0 THEN 'Monday'
+          WHEN 1 THEN 'Tuesday'
+          WHEN 2 THEN 'Wednesday'
+          WHEN 3 THEN 'Thursday'
+          WHEN 4 THEN 'Friday'
+          WHEN 5 THEN 'Saturday'
+          WHEN 6 THEN 'Sunday'
+        END
+
+      LEFT JOIN h_attendance_emp a
+        ON a.employeeID = e.employeeID
+        AND (
+          (ds.startTime <= ds.endTime AND a.date = d.work_date)
+          OR
+          (ds.startTime > ds.endTime AND (
+            (a.date = d.work_date)
+            OR
+            (a.date = DATE_ADD(d.work_date, INTERVAL 1 DAY) AND a.entryTime <= ds.endTime)
+          ))
+        )
+
+      LEFT JOIN permissionattendance_emp p
+        ON p.employeeID = e.employeeID
+        AND DATE(p.date) = d.work_date
+        AND p.isApproved = 1
+      LEFT JOIN permissiontype_emp pt
+        ON pt.permissionTypeID = p.permissionTypeID
+
+      WHERE d.work_date BETWEEN ? AND ?
+        AND e.requiredAttendance = 1
+        AND e.isActive = 1
+        AND a.hattendanceID IS NOT NULL
+        AND (
+          CASE
+            WHEN ds.startTime <= ds.endTime THEN
+              TIME_TO_SEC(a.entryTime) > (TIME_TO_SEC(ds.startTime) + 59)
+            WHEN a.date = d.work_date THEN
+              TIME_TO_SEC(a.entryTime) > (TIME_TO_SEC(ds.startTime) + 59)
+            ELSE
+              (TIME_TO_SEC(a.entryTime) + 86400) > (TIME_TO_SEC(ds.startTime) + 59)
+          END
+        )
+        AND (
+          ? = 'all'
+          OR (? = 'with' AND p.permissionID IS NOT NULL)
+          OR (? = 'without' AND p.permissionID IS NULL)
+        )
+
+      ORDER BY d.work_date, e.codeEmployee;
+      `,
+      [S, E, S, E, pf, pf, pf]
+    );
+
+    if (!rows.length) {
+      return res.status(200).json({ message: "No hay tardías para el rango seleccionado." });
+    }
+
+    // fechas reales
+    const dateSet = new Set();
+    for (const r of rows) dateSet.add(dayjs(r.work_date).format("YYYY-MM-DD"));
+    const dates = Array.from(dateSet).sort((a, b) => a.localeCompare(b));
+
+    // pivot
+    const employeesMap = new Map();
+
+    for (const r of rows) {
+      const dateStr = dayjs(r.work_date).format("YYYY-MM-DD");
+
+      if (!employeesMap.has(r.employeeID)) {
+        employeesMap.set(r.employeeID, {
+          employeeID: r.employeeID,
+          codeEmployee: r.codeEmployee,
+          fullName: r.fullName || "",
+          areaName: r.areaName || "",
+          payrollTypeName: r.payrollTypeName || "",
+          datos: {},
+        });
+      }
+
+      const emp = employeesMap.get(r.employeeID);
+
+      const lateSec = Number(r.lateSeconds) || 0;
+      const lateMin = Math.max(0, Math.floor(lateSec / 60));
+      const entry = r.entryTime ? dayjs(`2000-01-01 ${r.entryTime}`).format("hh:mm A") : "";
+      const hasPermission = !!r.permissionID;
+
+      const cellObj = {
+        text: hasPermission ? `${entry} (${lateMin}m) P` : `${entry} (${lateMin}m)`,
+        hasPermission,
+        lateSeconds: lateSec,
+        lateMinutes: lateMin,
+      };
+
+      // quedarse con la más tardía si hay duplicados
+      const prev = emp.datos[dateStr];
+      if (!prev || cellObj.lateSeconds > (prev.lateSeconds || 0)) {
+        emp.datos[dateStr] = cellObj;
+      }
+    }
+
+    // lista de empleados + total minutos de tardía
+    const employees = Array.from(employeesMap.values()).map((emp) => {
+      let totalLateMinutes = 0;
+      for (const d of dates) totalLateMinutes += Number(emp.datos[d]?.lateMinutes || 0);
+      return { ...emp, totalLateMinutes };
+    });
+
+    // ordenar por código numérico si se puede
+    employees.sort((a, b) => {
+      const na = Number(a.codeEmployee);
+      const nb = Number(b.codeEmployee);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+      return String(a.codeEmployee).localeCompare(String(b.codeEmployee));
+    });
+
+    // Excel
+    const ExcelJS = require("exceljs");
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet("Tardías");
+
+    const headerRow = [
+      "Código",
+      "Empleado",
+      "Área",
+      "Planilla",
+      ...dates.map((d) => `${d}\n${dayjs(d).locale("es").format("ddd")}`),
+      "Total tardías (min)",
+    ];
+    ws.addRow(headerRow);
+
+    // header style
+    const headerRowNum = ws.rowCount;
+    for (let col = 1; col <= headerRow.length; col++) {
+      const cell = ws.getCell(headerRowNum, col);
+      cell.font = { bold: true, color: { argb: "FFFFFF" }, size: 11 };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "4472C4" } };
+      cell.alignment = { horizontal: "center", vertical: "center", wrapText: true };
+      cell.border = {
+        top: { style: "thin" },
+        bottom: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+
+    const COLOR_WITH = "FFEB9C"; // con permiso
+    const COLOR_WITHOUT = "FFC7CE"; // sin permiso
+
+    for (const emp of employees) {
+      // >>> CLAVE: Código como NÚMERO para que Excel no lo guarde como texto
+      const codeNum = Number.parseInt(String(emp.codeEmployee).trim(), 10);
+      const codeCellValue = Number.isFinite(codeNum) ? codeNum : emp.codeEmployee;
+
+      const row = [codeCellValue, emp.fullName, emp.areaName, emp.payrollTypeName];
+
+      for (const d of dates) row.push(emp.datos[d]?.text ?? "");
+
+      row.push(emp.totalLateMinutes);
+
+      const rowNum = ws.addRow(row).number;
+
+      for (let col = 1; col <= row.length; col++) {
+        const cell = ws.getCell(rowNum, col);
+
+        // Formatos para evitar "Number stored as text"
+        if (col === 1 && Number.isFinite(codeNum)) {
+          cell.value = codeNum;
+          cell.numFmt = "0";
+        }
+        if (col === row.length) {
+          // Total tardías (min)
+          cell.numFmt = "0";
+        }
+
+        cell.alignment = { horizontal: "center", vertical: "center", wrapText: true };
+        cell.border = {
+          top: { style: "thin" },
+          bottom: { style: "thin" },
+          left: { style: "thin" },
+          right: { style: "thin" },
+        };
+        cell.font = { size: 10 };
+
+        // celdas de fechas: empiezan en col 5 (Código, Empleado, Área, Planilla = 4)
+        const firstDateCol = 5;
+        const lastDateCol = firstDateCol + dates.length - 1;
+
+        if (col >= firstDateCol && col <= lastDateCol) {
+          const dateKey = dates[col - firstDateCol];
+          const cellObj = emp.datos[dateKey];
+          if (cellObj?.text) {
+            cell.fill = {
+              type: "pattern",
+              pattern: "solid",
+              fgColor: { argb: cellObj.hasPermission ? COLOR_WITH : COLOR_WITHOUT },
+            };
+          }
+        }
+      }
+    }
+
+    // Anchos
+    ws.getColumn(1).width = 12; // Código
+    ws.getColumn(2).width = 35; // Empleado
+    ws.getColumn(3).width = 18; // Área
+    ws.getColumn(4).width = 16; // Planilla
+
+    const firstDateCol = 5;
+    const lastDateCol = firstDateCol + dates.length - 1;
+    for (let i = firstDateCol; i <= lastDateCol; i++) ws.getColumn(i).width = 18;
+
+    ws.getColumn(lastDateCol + 1).width = 18; // Total tardías (min)
+
+    // Congelar (4 columnas fijas)
+    ws.views = [{ xSplit: 4, ySplit: 1, topLeftCell: "E2", activeCell: "E2", state: "frozen" }];
+
+    // También ayuda a Excel a tratar la columna como número
+    ws.getColumn(1).numFmt = "0";
+    ws.getColumn(lastDateCol + 1).numFmt = "0";
+
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    const fileName =
+      startDate && endDate
+        ? `Reporte_Tardias_${S}_a_${E}_${pf}.xlsx`
+        : `Reporte_Tardias_Week_${nummWeek}_${pf}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send(buffer);
+  } catch (error) {
+    console.error("Error en exportLateAttendanceReport:", error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.getLateAttendanceByRange = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { nummWeek, startDate, endDate, permissionFilter } = req.query;
+
+    const range = normalizeRange({ nummWeek, startDate, endDate });
+    if (!range) {
+      return res.status(400).json({
+        message: "Debe proporcionar nummWeek o startDate y endDate",
+      });
+    }
+
+    const { startDate: S, endDate: E } = range;
+
+    // all | with | without
+    const pfRaw = String(permissionFilter ?? "all").toLowerCase();
+    const pf = pfRaw === "with" || pfRaw === "without" ? pfRaw : "all";
+
+      const [rows] = await db.query(
+    `
+    WITH RECURSIVE date_range AS (
+      SELECT DATE(?) AS work_date
+      UNION ALL
+      SELECT DATE_ADD(work_date, INTERVAL 1 DAY)
+      FROM date_range
+      WHERE work_date < DATE(?)
+    )
+    SELECT 
+      e.employeeID,
+      e.codeEmployee,
+      CONCAT(e.firstName,' ',COALESCE(e.middleName,''),' ',e.lastName) AS fullName,
+      area.areaName,
+
+      pay.payrollName AS payrollTypeName,
+
+      d.work_date,
+
+      a.date AS attendanceDate,
+      a.entryTime,
+      ds.startTime AS shiftStartTime,
+      ds.endTime   AS shiftEndTime,
+
+      p.permissionID,
+      pt.permissionTypeName,
+      p.comment,
+
+      (
+        CASE
+          WHEN ds.startTime <= ds.endTime THEN
+            TIME_TO_SEC(a.entryTime) - TIME_TO_SEC(ds.startTime)
+          WHEN a.date = d.work_date THEN
+            TIME_TO_SEC(a.entryTime) - TIME_TO_SEC(ds.startTime)
+          ELSE
+            (TIME_TO_SEC(a.entryTime) + 86400) - TIME_TO_SEC(ds.startTime)
+        END
+      ) AS lateSeconds
+
+    FROM employees_emp e
+    INNER JOIN area_emp area ON area.areaID = e.areaID
+
+    LEFT JOIN payrolltype_emp pay
+      ON pay.payrollTypeID = e.payrollTypeID
+
+    CROSS JOIN date_range d
+
+    INNER JOIN detailsshift_emp ds
+      ON ds.shiftID = e.shiftID
+      AND ds.day = CASE WEEKDAY(d.work_date)
+        WHEN 0 THEN 'Monday'
+        WHEN 1 THEN 'Tuesday'
+        WHEN 2 THEN 'Wednesday'
+        WHEN 3 THEN 'Thursday'
+        WHEN 4 THEN 'Friday'
+        WHEN 5 THEN 'Saturday'
+        WHEN 6 THEN 'Sunday'
+      END
+
+    LEFT JOIN h_attendance_emp a
+      ON a.employeeID = e.employeeID
+      AND (
+        (ds.startTime <= ds.endTime AND a.date = d.work_date)
+        OR
+        (ds.startTime > ds.endTime AND (
+          (a.date = d.work_date)
+          OR
+          (a.date = DATE_ADD(d.work_date, INTERVAL 1 DAY) AND a.entryTime <= ds.endTime)
+        ))
+      )
+
+    -- CORRECCIÓN REAL
+    -- CORRECCIÓN: Unimos el permiso solo si cubre la hora de entrada
+    LEFT JOIN permissionattendance_emp p
+      ON p.employeeID = e.employeeID
+      AND DATE(p.date) = d.work_date
+      AND p.isApproved = 1
+      AND (
+        -- Validamos que la hora de entrada de asistencia esté entre
+        -- la salida estimada y el regreso estimado del permiso
+        TIME(a.entryTime) BETWEEN p.exitTimePermission AND p.entryTimePermission
+      )
+      
+    LEFT JOIN permissiontype_emp pt
+      ON pt.permissionTypeID = p.permissionTypeID
+
+    WHERE d.work_date BETWEEN ? AND ?
+      AND e.requiredAttendance = 1
+      AND e.isActive = 1
+      AND a.hattendanceID IS NOT NULL
+
+      AND (
+        CASE
+          WHEN ds.startTime <= ds.endTime THEN
+            TIME_TO_SEC(a.entryTime) > (TIME_TO_SEC(ds.startTime) + 59)
+          WHEN a.date = d.work_date THEN
+            TIME_TO_SEC(a.entryTime) > (TIME_TO_SEC(ds.startTime) + 59)
+          ELSE
+            (TIME_TO_SEC(a.entryTime) + 86400) > (TIME_TO_SEC(ds.startTime) + 59)
+        END
+      )
+
+      AND (
+        ? = 'all'
+        OR (? = 'with' AND p.permissionID IS NOT NULL)
+        OR (? = 'without' AND p.permissionID IS NULL)
+      )
+
+    ORDER BY d.work_date, e.codeEmployee;
+    `,
+    [S, E, S, E, pf, pf, pf]
+    );
+    // ✅ FIX #2: fechas reales desde los datos
+    const dateSet = new Set();
+    for (const r of rows) {
+      dateSet.add(dayjs(r.work_date).format("YYYY-MM-DD"));
+    }
+    const dates = Array.from(dateSet).sort((a, b) => a.localeCompare(b));
+
+    // ✅ Pivot tipo Ausencias
+    const employeesMap = new Map();
+
+    for (const r of rows) {
+      const dateStr = dayjs(r.work_date).format("YYYY-MM-DD");
+
+      if (!employeesMap.has(r.employeeID)) {
+        employeesMap.set(r.employeeID, {
+          employeeID: r.employeeID,
+          codeEmployee: r.codeEmployee,
+          fullName: r.fullName || "",
+          areaName: r.areaName || "",
+          datos: {}, // date => obj
+        });
+      }
+
+      const emp = employeesMap.get(r.employeeID);
+
+      const lateMin = Math.max(0, Math.floor((Number(r.lateSeconds) || 0) / 60));
+      const hasPermission = !!r.permissionID;
+
+      const cellObj = {
+        entryTime: r.entryTime ? dayjs(`2000-01-01 ${r.entryTime}`).format("HH:mm:ss") : "",
+        shiftStartTime: r.shiftStartTime ? dayjs(`2000-01-01 ${r.shiftStartTime}`).format("HH:mm:ss") : "",
+        lateMinutes: lateMin,
+        lateSeconds: Number(r.lateSeconds) || 0,
+        hasPermission,
+        permissionTypeName: r.permissionTypeName || "",
+        comment: r.comment || "",
+      };
+
+      // ✅ FIX #3: si hay múltiples marcas el mismo día, quedarse con la tardía más grande
+      const prev = emp.datos[dateStr];
+      if (!prev || (cellObj.lateSeconds > (prev.lateSeconds || 0))) {
+        emp.datos[dateStr] = cellObj;
+      }
+    }
+
+    const employees = Array.from(employeesMap.values()).sort((a, b) => {
+      const na = Number(a.codeEmployee);
+      const nb = Number(b.codeEmployee);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+      return String(a.codeEmployee).localeCompare(String(b.codeEmployee));
+    });
+
+    return res.status(200).json({
+      success: true,
+      dates,
+      employees,
+      meta: { startDate: S, endDate: E, permissionFilter: pf },
+    });
+  } catch (error) {
+    console.error("Error en getLateAttendanceByRange:", error);
+    return res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+
+exports.recordAttendanceByDate = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { employeeID, date } = req.query;
+
+    const [times] = await db.query(
+      `
+        SELECT p.permissionID, entryTime, exitTime, exitPermission, entryPermission, h.date 
+        FROM permissionattendance_emp p 
+        left join h_attendance_emp h  on h.date = p.date and h.employeeID = p.employeeID
+        where p.date = ? and p.employeeID = ?
+        order by exitPermission desc
+        limit 1;
+      `,
+      [date, employeeID]
+    );
+
+    res.json(times);
+  } catch (error) {
+    console.error("Error en recordAttendanceByDate:", error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+

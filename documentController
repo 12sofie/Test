@@ -1,0 +1,860 @@
+const dayjs = require("dayjs");
+const db = require("../../config/db");
+const {
+  camposAuditoriaADD,
+  camposAuditoriaUPDATE,
+} = require("../../helpers/columnasAuditoria");
+const { t } = require("i18next");
+const PDFDocument = require("pdfkit");
+const fs = require("fs");
+
+// Obtener todas las facturas
+exports.getPurchaseOrders = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [purchaseOrders] = await db.query(
+      `
+      select 
+			  p.purchaseOrderID, p.purchaseNumber, v.supplierID, v.brandName,
+        p.purchaseOrderID, p.dateOrder, p.customer, p.createdDate, p.createdBy, u.username
+			  from inventorydev.purchaseorder_inv p 
+			  LEFT JOIN pmsb.users_us u ON u.userID = p.createdBy
+			  LEFT JOIN inventorydev.supplier v ON v.supplierID = p.supplierID
+			  order by p.dateOrder desc;
+      `
+    );
+
+    //Obtener los documentos en que a venido cada orden de compra
+    const [documents] = await db.query(
+      `
+          select 
+          sum(db.quantity) quantity, db.documentID, doc.documentNumber, 
+          doc.date, po.purchaseOrderID, po.purchaseNumber
+          from inventorydev.dbase_inv db
+          inner join inventorydev.document_fac doc on doc.documentID = db.documentID
+          inner join inventorydev.purchaseorder_inv po on po.purchaseOrderID = db.purchaseOrderID
+          group by db.documentID, doc.documentNumber, 
+          doc.date, po.purchaseOrderID, po.purchaseNumber
+          order by purchaseNumber asc;
+      `
+    );
+
+    // Asociar los documentos a sus respectivas órdenes de compra
+    const purchaseOrdersWithDocuments = purchaseOrders.map((order) => {
+      const relatedDocuments = documents.filter(
+        (doc) => doc.purchaseOrderID === order.purchaseOrderID
+      );
+      return { ...order, documents: relatedDocuments };
+    });
+
+    res.json({
+      purchaseOrders: purchaseOrdersWithDocuments,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+// Obtener todos los documentos
+exports.getdocuments = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [documents] = await db.query(
+      `
+          select 
+          d.documentID, d.documentNumber, d.date,
+          d.totalPrice, d.total, d.cantRollos, d.dueDate,
+          d.createdDate, d.createdBy, u.username
+          from inventorydev.document_fac d 
+          LEFT JOIN pmsb.users_us u ON u.userID = d.createdBy
+          ORDER BY d.date DESC;
+      `
+    );
+
+    res.json({ documents, message: t("getSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+// Obtener todos los proveedores
+exports.getSuppliers = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const [suppliers] = await db.query(
+      `
+            SELECT supplierID, brandName, leadTime
+            FROM inventorydev.supplier
+            ORDER BY brandName;
+      `
+    );
+
+    res.json(suppliers);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+// Obtener códigos de ítem y sus proveedores
+// exports.getItemCodeSupplier = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+
+//   try {
+//     const [itemCodeSuppliers] = await db.query(
+//       `
+//                       SELECT 
+//                       i.itemCode, i.supplierID, i.itemCodeSupplier, i.partNumberID, p.codePAH, p.units
+//                       FROM inventorydev.itemcodesupplier i
+//                       inner join inventorydev.partnumber_inv p on p.partNumberID = i.partNumberID
+//                       ORDER BY i.itemCode;
+//                     `
+//     );
+
+//     res.json(itemCodeSuppliers);
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({ message: t("getError", language) });
+//   }
+// };
+
+exports.getItemCodeSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const [itemCodeSuppliers] = await db.query(`
+      SELECT 
+        i.itemCode,
+        i.supplierID,
+        i.itemCodeSupplier,
+        i.partNumberID,
+        i.descriptionES,
+        i.descriptionEN,
+        p.codePAH,
+        p.units
+      FROM inventorydev.itemcodesupplier i
+      INNER JOIN inventorydev.partnumber_inv p ON p.partNumberID = i.partNumberID
+      ORDER BY i.itemCode;
+    `);
+
+    res.json(itemCodeSuppliers);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+
+// Crear un nuevo documento
+exports.createdocument = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const companyID = req.headers["accept-companyid"];
+
+    const { document, documentExtra } = req.body;
+
+    // Validar no insertar la misma factura dos veces
+    const [existingDocuments] = await db.query(
+      `
+        SELECT documentNumber FROM inventorydev.document_fac WHERE documentNumber = ?;
+      `,
+      [document.documentNumber]
+    );
+
+    if (existingDocuments.length > 0) {
+      return res
+        .status(400)
+        .json({ message: t("documentDuplicate", language) });
+    }
+
+    const [result] = await db.query(
+      `
+            INSERT INTO inventorydev.document_fac (documentNumber, date,
+            totalPrice, total, cantRollos, dueDate, companyID, createdDate, createdBy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+      `,
+      [
+        document.documentNumber,
+        dayjs(document.date).format("YYYY-MM-DD"),
+        parseFloat(document.totalPrice) || 0,
+        parseFloat(document.total) || 0,
+        document.cantRollos || 0,
+        dayjs(document.dueDate).format("YYYY-MM-DD"),
+        companyID,
+        camposAuditoriaADD(req),
+      ]
+    );
+
+    const documentID = result.insertId;
+
+    if (
+      documentExtra?.ducaNumber ||
+      documentExtra?.correlative ||
+      documentExtra?.guiaNumber
+    ) {
+      await db.query(
+        `
+            INSERT INTO inventorydev.documentextra_fac (documentID, ducaNumber, correlative, guiaNumber, createdDate, createdBy)
+            VALUES (?, ?, ?, ?, ?);
+          `,
+        [
+          documentID,
+          documentExtra.ducaNumber,
+          documentExtra.correlative,
+          documentExtra.guiaNumber,
+          camposAuditoriaADD(req),
+        ]
+      );
+    }
+
+    res.status(201).json({
+      message: t("saveSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("saveError", language) });
+  }
+};
+
+// Obtener Detalle de la purchase order de un documento
+exports.getPurchaseOrderDetails = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const purchaseOrderID = req.params.purchaseOrderID;
+
+  try {
+    const [detailPurchase] = await db.query(
+      `
+          select dpo.detailpurchaseID, p.partNumberID, p.codePAH, p.categoryID, p.units, 
+          concat(p.codePAH, '-',c.code) partNumber, dpo.price,
+          concat(p.descriptionEN, ' / ', c.description) description,
+          dpo.purchaseOrderID, po.purchaseNumber, dpo.quantity
+          from inventorydev.detailpurchase_inv dpo
+          left join inventorydev.purchaseorder_inv po on po.purchaseOrderID = dpo.purchaseOrderID
+          left join inventorydev.itemcodesupplier item on item.itemCode = dpo.itemCodeSupplier
+          left join inventorydev.partnumber_inv p on p.partNumberID = dpo.partNumberID
+          left join inventorydev.colors_inv c on c.colorID = dpo.colorID
+          where po.purchaseOrderID = ?;
+      `,
+      [purchaseOrderID]
+    );
+
+    const [detailMaterial] = await db.query(
+      `
+        SELECT 
+            COALESCE(count(db.controlNumber), 0) cantControls, 
+            COALESCE(sum(db.quantity), 0) quantity, 
+            dpo.detailpurchaseID, dpo.purchaseOrderID, po.purchaseNumber, 
+            concat(part.codePAH, '-', c.code) codePAH, part.units,
+            dpo.quantity as quantityReq,
+            concat(item.descriptionEN, ' ','(', item.itemCodeSupplier,')') description
+        FROM inventorydev.detailpurchase_inv dpo
+        LEFT JOIN inventorydev.purchaseorder_inv po ON po.purchaseOrderID = dpo.purchaseOrderID
+        LEFT JOIN inventorydev.partnumber_inv part ON part.partNumberID = dpo.partNumberID
+        LEFT JOIN inventorydev.colors_inv c ON c.colorID = dpo.colorID 
+        LEFT JOIN inventorydev.dbase_inv db ON db.purchaseOrderID = dpo.purchaseOrderID 
+            AND db.partNumberID = dpo.partNumberID 
+            AND db.colorID = dpo.colorID
+		    LEFT JOIN inventorydev.itemcodesupplier item on item.itemCode = dpo.itemCodeSupplier
+        WHERE dpo.purchaseOrderID = ?
+        GROUP BY dpo.detailpurchaseID, dpo.purchaseOrderID, po.purchaseNumber, 
+        dpo.partNumberID, dpo.colorID, concat(part.codePAH, '-', c.code), 
+        part.units, dpo.quantity;
+      `,
+      [purchaseOrderID]
+    );
+
+    res.json({
+      detailPurchase,
+      detailMaterial,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+// Actualizar una orden de compra
+exports.updatePurchaseOrder = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const purchaseOrderID = req.params.purchaseOrderID;
+  const { purchaseOrder } = req.body;
+
+  try {
+    if (!purchaseOrder || purchaseOrderID === undefined) {
+      return res.status(400).json({ message: t("requiredFields", language) });
+    }
+
+    await db.query(
+      `
+        UPDATE inventorydev.purchaseorder_inv
+        SET purchaseNumber = ?, dateOrder = ?, 
+        customer = ?, updatedDate = ?, updatedBy = ?
+        WHERE purchaseOrderID = ?;
+      `,
+      [
+        purchaseOrder.purchaseNumber,
+        dayjs(purchaseOrder.dateOrder).format("YYYY-MM-DD"),
+        purchaseOrder.customer,
+        ...camposAuditoriaUPDATE(req),
+        purchaseOrderID,
+      ]
+    );
+
+
+
+
+    for (const detail of purchaseOrder.detailPurchase) {
+      await db.query(
+        `
+        INSERT INTO inventorydev.detailpurchase_inv
+              (
+              purchaseOrderID, partNumberID, colorID, itemCodeSupplier, quantity, price, createdDate, createdBy)
+              VALUES
+              (?, ?, ?, ?, ?, ?, ?, ?);`,
+        [
+          purchaseOrderID,
+          detail.partNumberID.partNumberID,
+          detail.colorID.colorID,
+          detail.itemCodeSupplier.itemCode,
+          parseFloat(detail.quantity),
+          parseFloat(detail.price),
+          ...camposAuditoriaADD(req),
+        ]
+      );
+    }
+
+    res.json({ message: t("updateSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+// Eliminar una orden de compra
+exports.deletePurchaseOrder = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const purchaseOrderID = req.params.purchaseOrderID;
+  try {
+    if (purchaseOrderID === undefined) {
+      return res.status(400).json({ message: t("requiredFields", language) });
+    }
+    // Validad que no existan dependencias antes de eliminar
+    const [dependencies] = await db.query(
+      `
+        SELECT COUNT(*) AS count
+        FROM inventorydev.dbase_inv
+        WHERE purchaseOrderID = ?;
+      `,
+      [purchaseOrderID]
+    );
+    if (dependencies[0].count > 0) {
+      return res
+        .status(500)
+        .json({ message: t("deleteErrorDependencies", language) });
+    }
+    await db.query(
+      `
+        DELETE FROM inventorydev.purchaseorder_inv
+        WHERE purchaseOrderID = ?;
+      `,
+      [purchaseOrderID]
+    );
+
+    res.json({ message: t("deleteSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+// Actualizar el detalle de una orden de compra
+exports.updateQuantityPurchaseOrderDetail = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const detailpurchaseID = req.params.detailpurchaseID;
+  const { quantity } = req.body;
+  try {
+    if (!quantity || quantity <= 0 || detailpurchaseID === undefined) {
+      return res.status(400).json({ message: t("requiredFields", language) });
+    }
+    await db.query(
+      `
+        UPDATE inventorydev.detailpurchase_inv
+        SET quantity = ?, updatedDate = ?, updatedBy = ?
+        WHERE detailpurchaseID = ?;
+      `,
+      [quantity, ...camposAuditoriaUPDATE(req), detailpurchaseID]
+    );
+    res.json({ message: t("updateSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+// Eliminar el detalle de una orden de compra
+exports.deletePurchaseOrderDetail = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const detailpurchaseID = req.params.detailpurchaseID;
+
+  try {
+    if (detailpurchaseID === undefined) {
+      return res.status(400).json({ message: t("requiredFields", language) });
+    }
+
+    // Validar que no existan dependencias antes de eliminar
+    const [detail] = await db.query(
+      `
+          Select * from inventorydev.detailpurchase_inv
+          WHERE detailpurchaseID = ?;
+      `,
+      [detailpurchaseID]
+    );
+
+    const [dependencies] = await db.query(
+      `
+          select * from 
+          inventorydev.dbase_inv db 
+          where purchaseOrderID = ? and db.partNumberID = ? and colorID = ?;
+      `,
+      [detail[0].purchaseOrderID, detail[0].partNumberID, detail[0].colorID]
+    );
+    if (dependencies.length > 0) {
+      return res
+        .status(500)
+        .json({ message: t("deleteErrorDependencies", language) });
+    }
+    await db.query(
+      `
+        DELETE FROM inventorydev.detailpurchase_inv
+        WHERE detailpurchaseID = ?;
+      `,
+      [detailpurchaseID]
+    );
+
+    res.json({ message: t("deleteSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+// Agregar una nueva orden de compra a un documento existente
+exports.addNewPurchaseOrder = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { purchaseOrder } = req.body;
+    let existingDocuments = [];
+
+    //Validar que no se duplique el número de orden de compra
+    [existingDocuments] = await db.query(
+      `SELECT * FROM inventorydev.purchaseorder_inv WHERE purchaseNumber = ?`,
+      [purchaseOrder.purchaseNumber]
+    );
+
+    if (existingDocuments.length > 0) {
+      return res
+        .status(400)
+        .json({ message: t("documentDuplicate", language) });
+    }
+
+    const [result] = await db.query(
+      `
+        INSERT INTO inventorydev.purchaseorder_inv (
+          purchaseNumber, dateOrder,
+          shipVia, shipTo, supplierID, customer,
+          specialInst, createdDate, createdBy
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+      `,
+      [
+        purchaseOrder.purchaseNumber,
+        dayjs(purchaseOrder.dateOrder).format("YYYY-MM-DD"),
+        purchaseOrder.shipVia,
+        purchaseOrder.shipTo,
+        purchaseOrder.supplierID?.supplierID,
+        purchaseOrder.customer,
+        purchaseOrder.specialInst,
+        camposAuditoriaADD(req),
+      ]
+    );
+    const purchaseOrderID = result.insertId;
+
+    // Insertar detalles de la orden de compra si es necesario
+    for (const detail of purchaseOrder.detailPurchase) {
+      await db.query(
+        `
+        INSERT INTO inventorydev.detailpurchase_inv
+              (
+              purchaseOrderID, partNumberID, colorID, itemCodeSupplier, quantity, price, createdDate, createdBy)
+              VALUES
+              (?, ?, ?, ?, ?, ?, ?);`,
+        [
+          purchaseOrderID,
+          detail.partNumberID.partNumberID,
+          detail.colorID.colorID,
+          detail.itemCodeSupplier.itemID,
+          parseFloat(detail.quantity),
+          parseFloat(detail.price),
+          camposAuditoriaADD(req),
+        ]
+      );
+    }
+    res.json({ message: t("saveSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("saveError", language) });
+  }
+};
+
+// Generar documento de requisición
+exports.generateRequisitionDocument = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { purchaseOrderID } = req.params;
+    const [purchaseOrder] = await db.query(
+      `
+      select 
+			  p.purchaseOrderID, p.purchaseNumber, v.supplierID, v.brandName,
+        p.purchaseOrderID, p.dateOrder, p.customer
+			  p.createdDate, p.createdBy, u.username
+			  from inventorydev.purchaseorder_inv p 
+			  LEFT JOIN pmsb.users_us u ON u.userID = p.createdBy
+			  LEFT JOIN inventorydev.supplier v ON v.supplierID = p.supplierID
+			  where p.purchaseOrderID = ?;
+      `,
+      [purchaseOrderID]
+    );
+
+    const [detailPurchase] = await db.query(
+      `
+          select dpo.detailpurchaseID, p.partNumberID, p.codePAH, p.categoryID, p.units, 
+          concat(p.codePAH, '-',c.code) partNumber, dpo.price,
+          concat(item.descriptionEN, ' ', item.itemCodeSupplier) description,
+          dpo.purchaseOrderID, po.purchaseNumber, dpo.quantity
+          from inventorydev.detailpurchase_inv dpo
+          left join inventorydev.purchaseorder_inv po on po.purchaseOrderID = dpo.purchaseOrderID
+          left join inventorydev.itemcodesupplier item on item.itemCode = dpo.itemCodeSupplier
+          left join inventorydev.partnumber_inv p on p.partNumberID = dpo.partNumberID
+          left join inventorydev.colors_inv c on c.colorID = dpo.colorID
+          where po.purchaseOrderID = ?;
+      `,
+      [purchaseOrderID]
+    );
+
+    console.log(purchaseOrder);
+    res.json({
+      purchaseOrder,
+      detailPurchase,
+      message: t("saveSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("saveError", language) });
+  }
+};
+
+// Generar PDF de Requisición de Compra
+exports.generatePurchaseRequisitionPDF = async (req, res) => {
+  console.log("llego");
+
+  const language = req.headers["accept-language"] || "en";
+  const purchaseOrderID = req.params.purchaseOrderID;
+
+  try {
+    // Obtener información de la orden de compra
+    const [purchaseOrderInfo] = await db.query(
+      `
+      SELECT 
+      po.purchaseOrderID, po.purchaseNumber, po.dateOrder,
+      s.supplierID, s.brandName, po.customer, 
+      po.createdDate, po.createdBy, u.username
+      FROM inventorydev.purchaseorder_inv po
+      LEFT JOIN inventorydev.supplier s ON s.supplierID = po.supplierID
+      LEFT JOIN pmsb.users_us u ON u.userID = po.createdBy
+      WHERE po.purchaseOrderID = ?
+      `,
+      [purchaseOrderID]
+    );
+
+    // Obtener detalles de la orden de compra
+    const [detailPurchase] = await db.query(
+      `
+      SELECT dpo.detailpurchaseID, p.partNumberID, p.codePAH, p.categoryID, p.units, 
+             concat(p.codePAH, '-',c.code) partNumber, dpo.price, 
+             item.itemCodeSupplier, item.descriptionEN, item.width, item.weight,
+             dpo.purchaseOrderID, po.purchaseNumber, dpo.quantity,
+             c.code as colorCode
+      FROM inventorydev.detailpurchase_inv dpo
+      LEFT JOIN inventorydev.purchaseorder_inv po ON po.purchaseOrderID = dpo.purchaseOrderID
+      LEFT JOIN inventorydev.itemcodesupplier item ON item.itemCode = dpo.itemCodeSupplier
+      LEFT JOIN inventorydev.partnumber_inv p ON p.partNumberID = dpo.partNumberID
+      LEFT JOIN inventorydev.colors_inv c ON c.colorID = dpo.colorID
+      WHERE po.purchaseOrderID = ?
+      `,
+      [purchaseOrderID]
+    );
+
+    if (purchaseOrderInfo.length === 0) {
+      return res.status(404).json({ message: t("notFound", language) });
+    }
+
+    const orderInfo = purchaseOrderInfo[0];
+
+    // Crear documento PDF
+    const doc = new PDFDocument({
+      margin: 50,
+      size: "A4",
+      layout: "landscape",
+    });
+
+    // Headers para descarga
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="requisition-${orderInfo.purchaseNumber}.pdf"`
+    );
+
+    // Pipe del PDF al response
+    doc.pipe(res);
+
+    // Título principal
+    doc
+      .fontSize(14)
+      .font("Helvetica-Bold")
+      .text("POWERS ATHLETIC DE HONDURAS", { align: "center" });
+    doc
+      .fontSize(12)
+      .font("Helvetica")
+      .text("REQUISITION OF PURCHASING", { align: "center" });
+    doc.moveDown(1);
+
+    // Información general (lado izquierdo)
+    const startY = 120;
+    doc.fontSize(10).font("Helvetica");
+
+    doc.text(`Dept. Request:`, 50, startY);
+    doc.text("Procurement", 150, startY);
+
+    doc.text(`Date:`, 50, startY + 15);
+    doc.text(dayjs(orderInfo.dateOrder).format("MM/DD/YYYY"), 150, startY + 15);
+
+    doc.text(`Customer/Program:`, 50, startY + 30);
+    doc.text(orderInfo.customer || "N/A", 150, startY + 30);
+
+    doc.text(`Name of the vendor:`, 50, startY + 45);
+    doc.text(orderInfo.brandName, 150, startY + 45);
+
+    doc.text(`Shipping Term:`, 50, startY + 60);
+    doc.text("CIF PAH", 150, startY + 60);
+
+    doc.text(`Payment Term:`, 50, startY + 75);
+    doc.text("Net 3 days", 150, startY + 75);
+
+    // Logo (lado derecho)
+    try {
+      doc.image("./public/logo.png", 650, startY, { width: 100, height: 80 });
+    } catch (error) {
+      // Si no se encuentra el logo, mostrar placeholder
+      doc.rect(650, startY, 100, 80).stroke();
+      doc.fontSize(8).text("POWERS ATHLETIC\nDE HONDURAS", 660, startY + 30, {
+        align: "center",
+        width: 80,
+      });
+    }
+
+    // Tabla de productos (optimizada para horizontal)
+    const tableTop = startY + 100;
+    const itemHeight = 20;
+
+    // Headers de la tabla
+    doc.fontSize(8).font("Helvetica-Bold");
+    const headers = [
+      "Item#",
+      "Code#",
+      "WL Part#",
+      "Description",
+      "Color",
+      "Width",
+      "Weight",
+      "QTY",
+      "Unit",
+      "Price",
+      "Total $",
+      "Program",
+    ];
+    const colWidths = [35, 50, 70, 180, 40, 50, 50, 50, 35, 60, 70, 80];
+    const colPositions = [50];
+
+    // Calcular posiciones de columnas
+    for (let i = 1; i < colWidths.length; i++) {
+      colPositions[i] = colPositions[i - 1] + colWidths[i - 1];
+    }
+
+    // Dibujar headers
+    headers.forEach((header, i) => {
+      doc.rect(colPositions[i], tableTop, colWidths[i], itemHeight).stroke();
+      doc.text(header, colPositions[i] + 2, tableTop + 5, {
+        width: colWidths[i] - 4,
+        align: "center",
+      });
+    });
+
+    // Dibujar filas de datos
+    doc.font("Helvetica");
+    let currentY = tableTop + itemHeight;
+    let totalAmount = 0;
+
+    detailPurchase.forEach((item, index) => {
+      const itemTotal = parseFloat(item.price) * parseFloat(item.quantity);
+      totalAmount += itemTotal;
+
+      const rowData = [
+        (index + 1).toString(),
+        item.itemCodeSupplier || "", // Code# (parte después del -)
+        item.partNumber, // WL Part#
+        item.descriptionEN,
+        item.colorCode || "",
+        item.width || "", // Width - vacío por ahora
+        item.weight || "", // Weight - vacío por ahora
+        parseFloat(item.quantity).toFixed(2),
+        item.units,
+        `$${parseFloat(item.price).toFixed(4)}`,
+        `$${itemTotal.toFixed(2)}`,
+        orderInfo.customerName || "",
+      ];
+
+      // Dibujar celdas de la fila
+      rowData.forEach((data, i) => {
+        doc.rect(colPositions[i], currentY, colWidths[i], itemHeight).stroke();
+        doc
+          .fontSize(7)
+          .text(data.toString(), colPositions[i] + 2, currentY + 6, {
+            width: colWidths[i] - 4,
+            align: i === 7 || i === 9 || i === 10 ? "right" : "left",
+          });
+      });
+
+      currentY += itemHeight;
+    });
+
+    // Agregar filas vacías hasta completar la tabla (más filas para horizontal)
+    const emptyRows = Math.max(0, 12 - detailPurchase.length);
+    for (let i = 0; i < emptyRows; i++) {
+      headers.forEach((_, colIndex) => {
+        doc
+          .rect(
+            colPositions[colIndex],
+            currentY,
+            colWidths[colIndex],
+            itemHeight
+          )
+          .stroke();
+      });
+      currentY += itemHeight;
+    }
+
+    // Total
+    doc.fontSize(10).font("Helvetica-Bold");
+    doc.text(
+      `$${totalAmount.toFixed(2)}`,
+      colPositions[10] + 2,
+      currentY + 10,
+      {
+        width: colWidths[10] - 4,
+        align: "right",
+      }
+    );
+
+    // Firmas
+    doc.fontSize(10).font("Helvetica");
+    doc.text("Requested by:", 50, currentY + 50);
+    doc.text("_________________________", 130, currentY + 50);
+
+    doc.text("Authorized by:", 50, currentY + 80);
+    doc.text("_________________________", 130, currentY + 80);
+
+    doc.end();
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.updateDocumentOrder = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { documentID } = req.params;
+    const { documentNumber, totalPrice, total, cantRollos } = req.body;
+
+    const _totalPrice = Number(totalPrice);
+    const _total = Number(total);
+    const _cantRollos = Number(cantRollos);
+
+    if (
+      Number.isNaN(_totalPrice) ||
+      Number.isNaN(_total) ||
+      Number.isNaN(_cantRollos)
+    ) {
+      return res.status(400).json({ message: t("invalidData", language) });
+    }
+
+    const [result] = await db.query(
+      `
+      UPDATE inventorydev.document_fac
+      SET documentNumber = ?,
+          totalPrice = ?,
+          total = ?,
+          cantRollos = ?,
+          updatedDate = ?,
+          updatedBy = ?
+      WHERE documentID = ?;
+      `,
+      [
+        documentNumber,
+        _totalPrice,
+        _total,
+        _cantRollos,
+        ...camposAuditoriaUPDATE(req),
+        documentID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: t("notFound", language) });
+    }
+
+    res.json({ message: t("updateSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.listDocumentOrders = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const [rows] = await db.query(`
+      SELECT
+        d.documentID,
+        d.documentNumber,
+        d.date,
+        d.totalPrice,
+        d.total,
+        d.cantRollos
+      FROM inventorydev.document_fac d
+      ORDER BY d.documentID DESC;
+    `);
+
+    res.json({ documents: rows, message: t("getSuccess", language) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};

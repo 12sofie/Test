@@ -1,0 +1,48 @@
+useEffect(() => {
+    if (poSelected?.purchaseOrderID) {
+        const fetchExistingDetails = async () => {
+            try {
+                const response = await apipms.get(`/document/detailsPurchaseOrder/${poSelected.purchaseOrderID}`);
+                
+                // Mapeo ajustado a las propiedades de tu tabla (líneas 370-385)
+                const existingDetails = response.data.detailPurchase.map(detail => ({
+                    // Guardamos el ID original para que el backend sepa que es un registro existente
+                    detailpurchaseID: detail.detailpurchaseID, 
+                    
+                    // Estructura para la columna 'Part Number'
+                    partNumberID: {
+                        partNumberID: detail.partNumberID,
+                        codePAH: detail.codePAH // Requerido por la línea 372
+                    },
+                    
+                    // Estructura para el código de color
+                    colorID: {
+                        colorID: detail.colorID,
+                        code: detail.colorID_Code || detail.colorCode // Debe ser el código (ej: 'Black')
+                    },
+                    
+                    // Estructura para la columna 'Descripción'
+                    itemCodeSupplier: {
+                        itemID: detail.itemID,
+                        descriptionES: detail.descriptionES, // Prioridad en línea 377
+                        descriptionEN: detail.description    // Segunda opción en línea 378
+                    },
+                    
+                    // Cantidad y Precio
+                    quantity: detail.quantityReq, // Tu tabla usa 'quantity' en la línea 383
+                    price: detail.price || 0
+                }));
+
+                setformPurchaseorder(prev => ({
+                    ...prev,
+                    detailPurchase: existingDetails
+                }));
+            } catch (error) {
+                console.error("Error cargando detalles:", error);
+                showToast('error', 'No se pudieron cargar los ítems previos');
+            }
+        };
+
+        fetchExistingDetails();
+    }
+}, [poSelected]);

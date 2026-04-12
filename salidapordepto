@@ -1,0 +1,577 @@
+import React, { useEffect, useState } from 'react'
+import {
+    Autocomplete, Button, FormControl, FormControlLabel, FormLabel, IconButton, InputLabel,
+    MenuItem, Radio, RadioGroup, Select, TextField, createFilterOptions
+} from '@mui/material'
+import { apipms } from '../../../../../service/apipms';
+import { useTranslation } from 'react-i18next';
+import { formatearFecha } from '../../../../../helpers/formatDate';
+import DeleteIcon from '@mui/icons-material/Delete';
+import SaveIcon from '@mui/icons-material/Save';
+import { useToast } from '../../../../../context/ToastContext';
+
+export const DeptoOut = () => {
+    const { t } = useTranslation();
+    const { showToast } = useToast();
+    const [deptos, setdeptos] = useState([]);
+    const [deptoSelec, setDeptoSelec] = useState("");
+    const [partNumberList, setpartNumberList] = useState([]);
+    const [colorsList, setcolorsList] = useState([]);
+    const [partSelected, setpartSelected] = useState(null);
+    const [colorSelected, setcolorSelected] = useState(null);
+    const [option, setoption] = useState("Parcial");
+    const [controlNumberSelected, setControlNumberSelected] = useState(null);
+    const [controlNumberList, setControlNumberList] = useState([]);
+    const [quantity, setQuantity] = useState("");
+    const [comment, setComment] = useState("");
+    const [controlsAdded, setcontrolsAdded] = useState([]);
+
+    useEffect(() => {
+        fetchData();
+    }, [])
+
+    useEffect(() => {
+        if (partSelected && colorSelected) {
+            // Aquí podrías hacer una llamada a la API para obtener los control numbers disponibles
+            apipms.get(`/dbase/controlsByOptions`, {
+                params: {
+                    partNumberID: partSelected.partNumberID,
+                    colorID: colorSelected.colorID
+                }
+            })
+                .then(res => {
+                    setControlNumberList(res.data || []);
+                }
+                ).catch(err => {
+                    console.error('Error fetching control numbers:', err);
+                    setControlNumberList([]);
+                });
+        } else {
+            setControlNumberList([]);
+        }
+    }, [partSelected, colorSelected]);
+
+    const fetchData = async () => {
+        const [deptos, partNumbers, colors] = await Promise.all([
+            apipms.get(`/dbase/deptosInv`),
+            apipms.get(`/filemaintenance/partnumber`),
+            apipms.get(`/filemaintenance/colors`)
+        ]);
+        setdeptos(deptos.data);
+        setpartNumberList(partNumbers.data.data);
+        setcolorsList(colors.data.data);
+    };
+
+    const dbaseConfig = {
+        options: controlNumberList || [],
+        getOptionLabel: (option) => `#${option.controlNumber} - ${option.partNumberPAH} (${option.qty_final} ${option.units})` || '',
+        filterOptions: (options, params) => {
+            const filter = createFilterOptions();
+            const filtered = filter(options, params);
+
+            // Si hay texto pero no hay coincidencias por controlNumber, buscar por partNumber
+            if (params.inputValue && filtered.length === 0) {
+                return options.filter(option =>
+                    option.partNumberPAH?.toLowerCase().includes(params.inputValue.toLowerCase()) ||
+                    option.controlNumber?.toLowerCase().includes(params.inputValue.toLowerCase())
+                );
+            }
+
+            // Buscar en ambos campos siempre
+            if (params.inputValue) {
+                return options.filter(option =>
+                    option.controlNumber?.toLowerCase().includes(params.inputValue.toLowerCase()) ||
+                    option.partNumberPAH?.toLowerCase().includes(params.inputValue.toLowerCase())
+                );
+            }
+
+            return filtered;
+        },
+        renderOption: (props, option) => (
+            <li {...props} key={option.dbaseID}>
+                <div style={{ display: "flex", flexDirection: "column", borderBottom: '1px solid #e3e3e3', paddingBottom: '4px' }}>
+                    <p style={{ fontSize: '0.7rem', margin: 0 }}><strong>#{option.controlNumber}</strong> - {option.partNumberPAH} </p>
+                    <p style={{ fontSize: '0.7rem', margin: 0 }}>📆 {formatearFecha(option.received)} <strong>(📍 {option.locationcode}) </strong>
+                        <span style={{ color: '#0c6800' }}>({option.qty_final} {option.units})</span>
+                    </p>
+                </div>
+            </li>
+        ),
+        isOptionEqualToValue: (option, value) => option.controlNumber === value?.controlNumber,
+    };
+
+    const defaultParts = {
+        options: partNumberList || [],
+        getOptionLabel: (option) => option.codePAH || '',
+    };
+    const defaultColors = {
+        options: colorsList || [],
+        getOptionLabel: (option) => option.code || '',
+    };
+
+    const compactListboxProps = {
+        sx: {
+            py: 0,
+            '& .MuiAutocomplete-option': {
+                minHeight: '26px',
+                fontSize: '0.72rem',
+                lineHeight: 1.1,
+                padding: '2px 9px'
+            }
+        }
+    };
+
+    const addControlToList = () => {
+        if (!controlNumberSelected) {
+            showToast('warn', 'Por favor selecciona un número de control');
+            return;
+        }
+        if (option === "Parcial" && (quantity === '' || isNaN(quantity) || quantity <= 0)) {
+            showToast('warn', 'Por favor ingresa una cantidad válida mayor a cero');
+            return;
+        }
+        if (option === "Parcial" && quantity > parseFloat(controlNumberSelected.qty_final)) {
+            showToast('warn', `La cantidad no puede ser mayor a la disponible (${controlNumberSelected.qty_final})`);
+            return;
+        }
+        const existingIndex = controlsAdded.findIndex(control => control.controlNumber === controlNumberSelected.controlNumber);
+        if (existingIndex !== -1) {
+            // Si ya existe, actualizar la cantidad
+            const updatedControls = [...controlsAdded];
+            updatedControls[existingIndex].quantity = option === "Parcial" ? quantity : controlNumberSelected.qty_final;
+            setcontrolsAdded(updatedControls);
+            showToast('success', 'Cantidad actualizada correctamente');
+            return;
+        }
+        setcontrolsAdded([...controlsAdded, { ...controlNumberSelected, quantity: option === "Parcial" ? quantity : controlNumberSelected.qty_final }]);
+        setControlNumberSelected(null);
+        setQuantity("");
+    };
+
+    const saveControlNumbersList = () => {
+        if (controlsAdded.length === 0) {
+            showToast('warn', 'No hay números de control para guardar');
+            return;
+        }
+        if (!deptoSelec) {
+            showToast('warn', 'Por favor selecciona un departamento');
+            return;
+        }
+        apipms.post('/dbase/outputByDeparment', {
+            deptoID: deptoSelec,
+            comment: comment,
+            controlList: controlsAdded
+        }).then(res => {
+            showToast('success', 'Salida registrada correctamente');
+            // Limpiar todo después de guardar  
+            setcontrolsAdded([]);
+            setDeptoSelec("");
+            setComment("");
+            setpartSelected(null);
+            setcolorSelected(null);
+        })
+            .catch(err => {
+                console.error('Error saving depto out:', err);
+                showToast('error', 'Error al registrar la salida, por favor intenta de nuevo');
+            });
+    };
+
+    return (
+        <div style={{ padding: '16px 20px' }} className="animate__animated animate__fadeInRight">
+            <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                marginBottom: '4px',
+                padding: '1px 4px',
+                background: 'linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)',
+                borderRadius: '10px',
+                border: '1px solid #cbd5e1',
+                boxShadow: '0 2px 4px rgba(0, 0, 0, 0.05)'
+            }}>
+
+                <h2 style={{
+                    margin: 0,
+                    color: '#1e40af',
+                    fontSize: '0.9rem',
+                    fontWeight: '600',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '3px'
+                }}>
+                    Salida por departamento
+                </h2>
+            </div>
+            <br />
+            <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px'
+            }}>
+                <div style={{
+                    display: 'flex',
+                    flexDirection: 'row',
+                    gap: '12px'
+                }}>
+                    <Autocomplete
+                        sx={{
+                            width: '100%',
+                            '& .MuiInputLabel-root': {
+                                fontSize: '0.72rem'
+                            },
+                            '& .MuiInputLabel-root.MuiInputLabel-shrink': {
+                                fontSize: '0.7rem'
+                            },
+                            '& .MuiOutlinedInput-root': {
+                                borderRadius: '9px',
+                                height: '32px',
+                                minHeight: '32px',
+                                backgroundColor: 'white',
+                                '& .MuiAutocomplete-input': {
+                                    padding: '3px 6px',
+                                    fontSize: '0.72rem'
+                                },
+                                '& fieldset': {
+                                    borderColor: '#d1d5db',
+                                },
+                                '&:hover fieldset': {
+                                    borderColor: '#9ca3af',
+                                },
+                                '&.Mui-focused fieldset': {
+                                    borderColor: '#3b82f6',
+                                    borderWidth: '2px'
+                                }
+                            }
+                        }}
+                        id='partNumber'
+                        {...defaultParts}
+                        ListboxProps={compactListboxProps}
+                        options={partNumberList}
+                        value={partSelected}
+                        onChange={(event, newValue) => {
+                            setpartSelected(newValue);
+                        }}
+                        renderInput={(params) => <TextField {...params} fullWidth size='small' variant='outlined'
+                            required label={t('partNumber')} />}
+                    />
+                    <Autocomplete
+                        sx={{
+                            width: '100%',
+                            '& .MuiInputLabel-root': {
+                                fontSize: '0.72rem'
+                            },
+                            '& .MuiInputLabel-root.MuiInputLabel-shrink': {
+                                fontSize: '0.7rem'
+                            },
+                            '& .MuiOutlinedInput-root': {
+                                borderRadius: '9px',
+                                height: '32px',
+                                minHeight: '32px',
+                                backgroundColor: 'white',
+                                '& .MuiAutocomplete-input': {
+                                    padding: '3px 6px',
+                                    fontSize: '0.72rem'
+                                },
+                                '& fieldset': {
+                                    borderColor: '#d1d5db',
+                                },
+                                '&:hover fieldset': {
+                                    borderColor: '#9ca3af',
+                                },
+                                '&.Mui-focused fieldset': {
+                                    borderColor: '#3b82f6',
+                                    borderWidth: '2px'
+                                }
+                            }
+                        }}
+                        id='color'
+                        {...defaultColors}
+                        ListboxProps={compactListboxProps}
+                        options={colorsList}
+                        value={colorSelected}
+                        onChange={(event, newValue) => {
+                            setcolorSelected(newValue);
+                        }}
+                        renderInput={(params) => <TextField {...params} fullWidth size='small' variant='outlined'
+                            required label="Color" />}
+                    />
+                </div>
+                <div style={{
+                    display: 'flex',
+                    flexDirection: 'row',
+                    gap: '12px'
+                }}>
+                    <FormControl
+                        variant="outlined"
+                        size="small"
+                        fullWidth
+                        sx={{
+                            flex: 1,
+                            '& .MuiOutlinedInput-root': {
+                                borderRadius: '9px',
+                                minHeight: '32px',
+                                backgroundColor: 'white'
+                            },
+                            '& .MuiSelect-select': {
+                                padding: '4px 7px',
+                                fontSize: '0.72rem',
+                                lineHeight: 1.1
+                            },
+                            '& .MuiInputLabel-root': {
+                                fontSize: '0.72rem'
+                            },
+                            '& .MuiInputLabel-root.MuiInputLabel-shrink': {
+                                fontSize: '0.7rem'
+                            }
+                        }}
+                    >
+                        <InputLabel id="depto-label">{t('depto')}</InputLabel>
+                        <Select
+                            labelId="depto-label"
+                            value={deptoSelec}
+                            onChange={(e) => setDeptoSelec(e.target.value)}
+                            label={t('depto')}
+                            MenuProps={{
+                                PaperProps: {
+                                    sx: {
+                                        '& .MuiMenuItem-root': {
+                                            minHeight: '28px',
+                                            fontSize: '0.72rem'
+                                        }
+                                    }
+                                }
+                            }}
+                        >
+                            {deptos.map((depto, index) => (
+                                <MenuItem sx={{ minHeight: '24px', fontSize: '0.72rem' }} key={index} value={depto.deptoID}>{depto.name}</MenuItem>
+                            ))
+                            }
+                        </Select>
+                    </FormControl>
+                    <FormControl sx={{ mt: '-2px' }}>
+                        <FormLabel id="tipo-label" sx={{ fontSize: '0.72rem', mb: '1px' }}>Tipo</FormLabel>
+                        <RadioGroup
+                            aria-labelledby="tipo-label"
+                            value={option}
+                            onChange={(e) => setoption(e.target.value)}
+                            name="tipo-radio-group"
+                            row
+                            sx={{
+                                gap: '4px',
+                                '& .MuiFormControlLabel-root': {
+                                    mr: '8px',
+                                    '& .MuiTypography-root': {
+                                        fontSize: '0.72rem'
+                                    }
+                                }
+                            }}
+                        >
+                            <FormControlLabel value="Parcial" control={<Radio size='small' sx={{ p: '4px' }} />} label="Parcial" />
+                            <FormControlLabel value="Completo" control={<Radio size='small' sx={{ p: '4px' }} />} label="Completo" />
+                        </RadioGroup>
+                    </FormControl>
+                </div>
+            </div>
+            <TextField
+                label={t('comment')}
+                variant="outlined"
+                size="small"
+                fullWidth
+                value={comment}
+                onChange={(e) => setComment(e.target.value)}
+                sx={{
+                    marginTop: '12px',
+                    marginBottom: '8px',
+                    '& .MuiOutlinedInput-root': {
+                        borderRadius: '10px',
+                        minHeight: '34px',
+                        backgroundColor: 'white'
+                    },
+                    '& .MuiOutlinedInput-input': {
+                        padding: '7px 10px',
+                        fontSize: '0.72rem'
+                    },
+                    '& .MuiInputLabel-root': {
+                        fontSize: '0.72rem'
+                    }
+                }}
+            />
+            <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px'
+            }}>
+                <Autocomplete
+                    disabled={!partSelected || !colorSelected}
+                    sx={{
+                        width: '100%',
+                        '& .MuiInputLabel-root': {
+                            fontSize: '0.75rem'
+                        },
+                        '& .MuiInputLabel-root.MuiInputLabel-shrink': {
+                            fontSize: '0.75rem'
+                        },
+                        '& .MuiOutlinedInput-root': {
+                            borderRadius: '10px',
+                            height: '34px',
+                            minHeight: '34px',
+                            backgroundColor: 'white',
+                            '& .MuiAutocomplete-input': {
+                                padding: '4px 6px',
+                                fontSize: '0.75rem'
+                            },
+                            '& fieldset': {
+                                borderColor: '#d1d5db',
+                            },
+                            '&:hover fieldset': {
+                                borderColor: '#9ca3af',
+                            },
+                            '&.Mui-focused fieldset': {
+                                borderColor: '#3b82f6',
+                                borderWidth: '2px'
+                            }
+                        }
+                    }}
+                    id='controlNumber'
+                    {...dbaseConfig}
+                    options={controlNumberList || []}
+                    value={controlNumberSelected}
+                    onChange={(event, newValue) => {
+                        setControlNumberSelected(newValue);
+                    }}
+                    renderInput={(params) => <TextField {...params} fullWidth size='small' variant='outlined'
+                        required label={t('controlNumber')} />}
+                />
+                <div style={{
+                    display: 'flex',
+                    flexDirection: 'row',
+                    gap: '8px'
+                }}>
+                    {option === "Parcial" &&
+                        <TextField
+                            label={t('quantity')}
+                            variant="outlined"
+                            size="small"
+                            value={quantity}
+                            onChange={(e) => setQuantity(e.target.value)}
+                            onBlur={(e) => {
+                                if (isNaN(e.target.value) || e.target.value <= 0) {
+                                    setQuantity('');
+                                    showToast('warn', 'La cantidad debe ser un número válido mayor a cero');
+                                    return;
+                                }
+                                if (e.target.value > parseFloat(controlNumberSelected?.qty_final || 0)) {
+                                    setQuantity('');
+                                    showToast('warn', `La cantidad no puede ser mayor a la disponible (${controlNumberSelected?.qty_final || 0})`);
+                                    return;
+                                }
+                            }}
+                            sx={{
+                                flex: '1 1 120px',
+                                minWidth: '120px',
+                                maxWidth: window.innerWidth <= 768 ? '100%' : '170px',
+                                '& .MuiOutlinedInput-root': {
+                                    borderRadius: '10px',
+                                    minHeight: '34px',
+                                    backgroundColor: 'white'
+                                },
+                                '& .MuiOutlinedInput-input': {
+                                    padding: '7px 10px',
+                                    fontSize: '0.82rem'
+                                },
+                                '& .MuiInputLabel-root': {
+                                    fontSize: '0.75rem'
+                                }
+                            }}
+                        />
+                    }
+                    <Button
+                        variant="contained"
+                        size='small'
+                        disabled={controlNumberSelected === null || (option === "Parcial" && (quantity === '' || isNaN(quantity) || quantity <= 0))}
+                        onClick={() => {
+                            addControlToList()
+                        }}
+                        sx={{
+                            borderRadius: '8px',
+                            width: window.innerWidth <= 768 ? '100%' : 'auto',
+                            minHeight: '30px',
+                            padding: '2px 8px',
+                            fontSize: '0.75rem',
+                            fontWeight: 600,
+                            background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                            '&:hover': {
+                                background: 'linear-gradient(135deg, #059669 0%, #047857 100%)'
+                            },
+                            '&:disabled': {
+                                background: '#d1d5db'
+                            }
+                        }}
+                    >
+                        {t('add')}
+                    </Button>
+                </div>
+
+
+            </div>
+            {/* lista de controles agregados con su cantidad */}
+
+            <div style={{ marginTop: '16px' }}>
+                <Button
+                    variant="contained"
+                    endIcon={<SaveIcon fontSize='small' />}
+                    onClick={() => saveControlNumbersList()}
+                    disabled={controlsAdded.length === 0}
+                    sx={{
+                        borderRadius: '10px',
+                        padding: '2px 5px',
+                        background: 'linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%)',
+                        fontSize: '0.8rem',
+                        fontWeight: '600',
+                        marginTop: 0,
+                        '&:hover': {
+                            background: 'linear-gradient(135deg, #1d4ed8 0%, #1e3a8a 100%)'
+                        },
+                        '&:disabled': {
+                            background: '#d1d5db'
+                        }
+                    }}
+                >
+                    {t('save')}
+                </Button>
+                <div style={{
+                    marginTop: '8px',
+                    maxHeight: window.innerWidth <= 768 ? '220px' : '280px',
+                    overflowY: 'auto',
+                    overflowX: 'hidden',
+                    border: '1px solid #e5e7eb',
+                    borderRadius: '10px',
+                    backgroundColor: '#ffffff',
+                    WebkitOverflowScrolling: 'touch',
+                    scrollbarGutter: 'stable'
+                }}>
+                    {controlsAdded.map((control, index) => (
+                        <div key={index} style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '8px',
+                            borderBottom: index === controlsAdded.length - 1 ? 'none' : '1px solid #e5e7eb'
+                        }}>
+                            <div>
+                                <p style={{ margin: 0, fontSize: '0.75rem' }}><strong>#{control.controlNumber}</strong> - {control.partNumberPAH}</p>
+                                <p style={{ margin: 0, fontSize: '0.72rem', color: '#4b5563' }}>Cantidad: {control.quantity} {control.units}</p>
+                            </div>
+                            <IconButton size="small" color="error" onClick={() => {
+                                setcontrolsAdded(controlsAdded.filter(c => c.controlNumber !== control.controlNumber));
+                            }}>
+                                <DeleteIcon fontSize='small' />
+                            </IconButton>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+        </div>
+    )
+}

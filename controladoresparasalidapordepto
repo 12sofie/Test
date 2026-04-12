@@ -1,0 +1,113 @@
+// Endpoint para obtener control por opciones
+exports.getControlByOptions = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const { partNumberID, colorID } = req.query;
+  try {
+    const [controlNumbers] = await db.query(
+      `
+            SELECT
+            db.dbaseID, db.controlNumber, db.rollo, db.received, part.partNumberID, loc.locationcode,
+            CONCAT(part.codePAH, '-', c.code) AS partNumberPAH, part.units, db.quantity AS qty_initial,
+            IFNULL(SUM(
+            CASE 
+              WHEN mt.type = 'IN'  THEN mv.quantity
+              WHEN mt.type = 'OUT' THEN -mv.quantity
+                ELSE 0
+            END
+            ), 0) AS qty_moves,
+            db.quantity + IFNULL(SUM(
+                CASE 
+                WHEN mt.type = 'IN'  THEN mv.quantity
+                WHEN mt.type = 'OUT' THEN -mv.quantity
+                    ELSE 0
+                END
+            ), 0) AS qty_final
+            FROM inventorydev.dbase_inv db
+            LEFT JOIN inventorydev.partnumber_inv part 
+                ON db.partNumberID = part.partNumberID
+            LEFT JOIN inventorydev.colors_inv c 
+                ON c.colorID = db.colorID
+            LEFT JOIN (
+              SELECT controlNumber, moveTypeID, quantity
+              FROM inventorydev.movescontrolworkorder_po
+              UNION ALL
+              SELECT controlNumber, moveTypeID, quantity
+              FROM inventorydev.miscellaneousmoves_inv
+            ) mv
+              ON mv.controlNumber = db.dbaseID
+            LEFT JOIN inventorydev.location_inv loc
+                ON loc.locationID = db.locationID
+            LEFT JOIN inventorydev.movetype_inv mt 
+              ON mt.moveTypeID = mv.moveTypeID
+            WHERE db.partNumberID IN (
+                ${partNumberID}
+            ) AND db.colorID IN (${colorID}, ${colorIDsWhite.join(",")})
+            GROUP BY
+                db.dbaseID,
+                db.controlNumber,
+                db.rollo,
+                db.received,
+                part.partNumberID,
+                part.codePAH,
+                c.code,
+                part.units,
+                db.quantity
+            HAVING qty_final > 0
+            ORDER BY db.received ASC;`
+    );
+    res.json(controlNumbers);
+  }
+  catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+}
+
+
+
+// Endpoint para guardar los movimientos de salida por departamento
+exports.saveOutputByDepto = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const { controlList, deptoID, comment } = req.body;
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const moveTypeID = 3;
+    const { formattedCorrelative, newCorrelative } = await generateCorrelative(
+      moveTypeID,
+      connection
+    );
+
+    for (const control of controlList) {
+      await connection.query(
+        `INSERT INTO inventorydev.movescontrolworkorder_po
+        (productionOrderID, moveTypeID, moveType, optionType, controlNumber, quantity, comment, createdDate, createdBy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+        [
+          deptoID,
+          moveTypeID,
+          formattedCorrelative,
+          'DP',
+          control.dbaseID,
+          parseFloat(control.quantity) || 0,
+          comment || null,
+          ...camposAuditoriaADD(req),
+        ]
+      );
+    }
+    // Actualizar el numero del correlativo en la tabla de tipos de movimiento
+    await updateCorrelative(moveTypeID, newCorrelative, connection);
+    await connection.commit();
+
+
+    ////// FALTA MOVER DE UBICACION ///////
+    res.json({ success: true, message: `Salida por departamento ${formattedCorrelative} registrada correctamente` });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(500).json({ success: false, message: `Error al registrar la salida por departamento` });
+  } finally {
+    connection.release();
+  }
+}

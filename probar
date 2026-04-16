@@ -1,0 +1,35 @@
+useEffect(() => {
+    const socket = io(SOCKET_SERVER_URL);
+
+    const handleInventoryUpdate = async () => {
+        // 1. Refrescar la lista principal de la tabla
+        fetchData();
+
+        // 2. Identificar qué filas están expandidas actualmente
+        // expandedRows es un objeto donde las llaves son los dbaseID (si dataKey="dbaseID")
+        const openRowIds = Object.keys(expandedRows);
+
+        if (openRowIds.length > 0) {
+            // 3. Limpiar el caché de los Kardex que se van a actualizar 
+            // para forzar la petición a la API
+            setKardexData(prev => {
+                const newKardex = { ...prev };
+                openRowIds.forEach(id => delete newKardex[id]);
+                return newKardex;
+            });
+
+            // 4. Disparar las peticiones para actualizar los datos de las filas abiertas
+            // Usamos Promise.all para que se ejecuten en paralelo
+            await Promise.all(openRowIds.map(id => getKardexByDbaseID(id)));
+        }
+
+        showToast('info', t('inventoryUpdateNotification'));
+    };
+
+    socket.on('inventoryUpdated', handleInventoryUpdate);
+
+    return () => {
+        socket.off('inventoryUpdated', handleInventoryUpdate);
+        socket.disconnect();
+    };
+}, [expandedRows]); // 🚩 IMPORTANTE: Agregar expandedRows como dependencia

@@ -1,0 +1,44 @@
+const express = require("express");
+const router = express.Router();
+const filemaintenanceController = require("../../controllers/InventoryControllers/filemaintenanceController");
+
+//Rutas de item code supplier
+router.get("/partnumber", filemaintenanceController.ListPartNumbers);
+router.get("/colors", filemaintenanceController.ListColors);
+router.post('/itemcodesupplier', filemaintenanceController.CreateItemCodeSupplier);
+router.get('/viewsupplieritemcode',filemaintenanceController.getItemCodeSupplier);
+router.put('/updatesupplieritemcode/:itemCode',filemaintenanceController.updateItemCodeSupplier);
+router.delete('/deleteitemcode/:itemCode',filemaintenanceController.deleteItemCodeSupplier);
+
+
+//Rutas de Part Numbers
+router.get('/viewOrderPartNumber',filemaintenanceController.getOrderPartNumber)
+router.post('/createPartNumber',filemaintenanceController.createPartNumber)
+router.put('/updatePartNumber/:partNumberID',filemaintenanceController.updatePartNumber)
+router.delete('/deletePartNumber/:partNumberID', filemaintenanceController.deletePartNumber);
+
+//Rutas de Proveedores 
+router.get('/viewsuppliers',filemaintenanceController.getSuppliers)
+router.post('/createSupplier',filemaintenanceController.createSupplier)
+router.put('/updateSupplier/:supplierID',filemaintenanceController.updateSupplier)
+router.delete('/deleteSupplier/:supplierID', filemaintenanceController.deleteSupplier);
+
+//Rutas de Localizaciones
+router.get('/viewlocations',filemaintenanceController.getLocations)
+router.post('/createLocation',filemaintenanceController.createLocation)
+router.put('/updateLocation/:locationID',filemaintenanceController.updateLocation)
+router.delete('/deleteLocation/:locationID', filemaintenanceController.deleteLocation);
+
+//Rutas de Clientes
+router.get('/viewcustomers',filemaintenanceController.getCustomers)
+router.post('/createCustomer',filemaintenanceController.createCustomer)
+router.put('/updateCustomer/:customerID',filemaintenanceController.updateCustomer)
+router.delete('/deleteCustomer/:customerID', filemaintenanceController.deleteCustomer);
+
+// Rutas para size de produccion 
+router.get('/viewsizes',filemaintenanceController.getSizes)
+router.post('/createSize',filemaintenanceController.createSizes)
+router.put('/updateSize/:sizeID',filemaintenanceController.updateSizes)
+router.delete('/deleteSize/:sizeID', filemaintenanceController.deleteSizes);
+
+module.exports = router;

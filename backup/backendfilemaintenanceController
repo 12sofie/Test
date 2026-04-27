@@ -1,0 +1,1227 @@
+const db = require("../../config/db");
+const dayjs = require("dayjs");
+const {
+  camposAuditoriaADD,
+  camposAuditoriaUPDATE,
+} = require("../../helpers/columnasAuditoria");
+const { t } = require("i18next");
+
+exports.ListPartNumbers = async (req, res) => {
+  try {
+    const sql = `
+      SELECT 
+        partNumberID,
+        codePAH,
+        codeWL
+      FROM inventorylesly.partnumber_inv
+      ORDER BY codePAH ASC
+    `;
+
+    const [rows] = await db.query(sql);
+
+    return res.status(200).json({
+      ok: true,
+      data: rows,
+    });
+  } catch (err) {
+    console.error("Error al obtener partnumbers:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error al obtener la lista de partnumbers",
+    });
+  }
+};
+
+exports.ListColors = async (req, res) => {
+  try {
+    const sql = `
+      SELECT * FROM inventorylesly.colors_inv;
+    `;
+
+    const [rows] = await db.query(sql);
+
+    return res.status(200).json({
+      ok: true,
+      data: rows,
+    });
+  } catch (err) {
+    console.error("Error al obtener colors:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error al obtener la lista de colors",
+    });
+  }
+};
+
+exports.CreateItemCodeSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const {
+      supplierID,
+      partNumberID,
+      itemCodeSupplier,
+      descriptionES,
+      descriptionEN,
+      fabricContent,
+      hts,
+      width,
+      weight,
+    } = req.body;
+
+    if (!supplierID || !partNumberID) {
+      return res.status(400).json({
+        ok: false,
+        message: "Proveedor y PartNumber son obligatorios",
+      });
+    }
+
+    if (!itemCodeSupplier || !itemCodeSupplier.trim()) {
+      return res.status(400).json({
+        ok: false,
+        message: "itemCodeSupplier es obligatorio",
+      });
+    }
+
+    if (!descriptionEN || !descriptionEN.trim()) {
+      return res.status(400).json({
+        ok: false,
+        message: "descriptionEN es obligatorio",
+      });
+    }
+
+    const [createdDate] = camposAuditoriaADD(req);
+
+    const sql = `
+      INSERT INTO inventorylesly.itemcodesupplier
+            (supplierID,
+            partNumberID,
+            itemCodeSupplier,
+            descriptionES,
+            descriptionEN,
+            fabricContent,
+            hts,
+            width,
+            weight,
+            createdDate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    const [result] = await db.query(sql, [
+      supplierID,
+      partNumberID,
+      itemCodeSupplier,
+      descriptionES || null,
+      descriptionEN,
+      fabricContent || null,
+      hts || null,
+      width || null,
+      weight || null,
+      createdDate,
+    ]);
+
+    return res.status(201).json({
+      ok: true,
+      message: t("saveSuccess", language) || "Registro guardado correctamente",
+      itemID: result.insertId,
+    });
+  } catch (err) {
+    console.error("Error al crear itemcodesupplier:", err);
+    return res.status(500).json({
+      ok: false,
+      message:
+        t("saveError", language) || "Error al crear el item code supplier",
+    });
+  }
+};
+
+exports.getItemCodeSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [itemCodeSuppliers] = await db.query(`
+    select 
+    spp.supplierID,
+    spp.brandName,
+    it.itemCodeSupplier,
+    pt.partNumberID,
+    pt.codePAH,
+    it.descriptionES,
+    it.descriptionEN,
+    it.fabricContent,
+    it.hts,
+    it.width,
+    it.weight
+    from inventorylesly.itemcodesupplier it
+    inner join inventorylesly.supplier spp on spp.supplierID = it.supplierID
+    inner join inventorylesly.partnumber_inv pt on pt.partNumberID = it.partNumberID
+    order by spp.supplierID asc
+    `);
+
+    const [suppliers] = await db.query(`
+    select 
+    supplierID,
+    brandName
+    from inventorylesly.supplier
+    `);
+
+    const [partNumbers] = await db.query(`
+    select 
+    partNumberID,
+    codePAH
+    from inventorylesly.partnumber_inv
+    `);
+
+    res.json({
+      itemCodeSuppliers,
+      suppliers,
+      partNumbers,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.updateItemCodeSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { itemCode } = req.params;
+    const {
+      supplierID,
+      partNumberID,
+      itemCodeSupplier,
+      descriptionES,
+      descriptionEN,
+      fabricContent,
+      hts,
+      width,
+      weight,
+    } = req.body;
+
+    const [updateDate, updateBy] = camposAuditoriaUPDATE(req);
+
+    const [result] = await db.query(
+      `
+            Update inventorylesly.itemcodesupplier
+            set
+            supplierID = ?,
+            partNumberID = ?,
+            itemCodeSupplier = ?,
+            descriptionES = ?,
+            descriptionEN = ?,
+            fabricContent = ?,
+            hts = ?,
+            width = ?,
+            weight = ?,
+            updateDate = ?,
+            updateBy = ?
+            where itemCodeSupplier = ?
+        `,
+      [
+        supplierID,
+        partNumberID,
+        itemCodeSupplier,
+        descriptionES,
+        descriptionEN,
+        fabricContent,
+        hts,
+        width,
+        weight,
+        updateDate,
+        updateBy,
+        itemCode,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Item Code Supplier no encontrado.",
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("updateSuccess", language) ||
+        "Item Code Supplier actualizado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.deleteItemCodeSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { itemCode } = req.params;
+    const [result] = await db.query(
+      `
+          DELETE FROM inventorylesly.itemcodesupplier
+          WHERE itemCodeSupplier = ?;
+        `,
+      [itemCode]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Item Code Supplier no encontrado.",
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) ||
+        "Item Code Supplier eliminado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+//Endpoint de Part Numbers
+exports.getOrderPartNumber = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const [partNumbers] = await db.query(`
+      SELECT 
+        pn.partNumberID,
+        pn.codePAH,
+        pn.codeWL,
+        pn.categoryID,
+        c.name AS categoryName,
+        pn.units,
+        pn.alternativeCodes
+      FROM inventorylesly.partnumber_inv pn
+      INNER JOIN inventorylesly.category_inv c ON pn.categoryID = c.categoryID
+      ORDER BY pn.partNumberID ASC
+    `);
+
+    const [categories] = await db.query(`
+      SELECT categoryID, name 
+      FROM inventorylesly.category_inv
+      ORDER BY categoryID ASC
+    `);
+
+    const [colors] = await db.query(`select * from inventorylesly.colors_inv;`);
+
+    res.json({
+      partNumbers,
+      categories,
+      colors,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.createPartNumber = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const {
+      codePAH,
+      codeWL,
+      categoryID,
+      units,
+      alternativeCodes = [],
+    } = req.body;
+
+    const clean = [
+      ...new Set(alternativeCodes.map((x) => String(x).trim()).filter(Boolean)),
+    ];
+    const altAsText = clean.join(", ");
+
+    const [existing] = await db.query(
+      `
+        SELECT partNumberID 
+        FROM inventorylesly.partnumber_inv
+        WHERE codePAH = ? OR codeWL = ?
+        LIMIT 1
+      `,
+      [codePAH, codeWL]
+    );
+
+    if (existing.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        message: t("partNumberExists", language) || "El part number ya existe",
+      });
+    }
+
+    const [result] = await db.query(
+      `
+            insert into inventorylesly.partnumber_inv (codePAH, codeWL,categoryID, units, alternativeCodes, createdDate,createdBy) VALUES (?,?,?,?,?,?)
+            `,
+      [
+        codePAH,
+        codeWL,
+        categoryID,
+        units,
+        altAsText,
+        camposAuditoriaADD(req),
+        camposAuditoriaADD(req),
+      ]
+    );
+
+    const partNumberID = result.insertId;
+
+    return res.status(201).json({
+      ok: true,
+      partNumberID,
+      message: t("saveSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("saveError", language) });
+  }
+};
+
+exports.updatePartNumber = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { partNumberID } = req.params;
+    const {
+      codePAH,
+      codeWL,
+      categoryID,
+      units,
+      alternativeCodes = [],
+    } = req.body;
+
+    const [updatedDate, updatedBy] = camposAuditoriaUPDATE(req);
+
+    const clean = [
+      ...new Set(alternativeCodes.map((x) => String(x).trim()).filter(Boolean)),
+    ];
+    const altAsText = clean.join(",");
+
+    const [result] = await db.query(
+      `
+        UPDATE inventorylesly.partnumber_inv
+        SET codePAH = ?, codeWL = ?, categoryID = ?, units = ?, alternativeCodes = ?, updatedDate = ?, updatedBy = ?
+        WHERE partNumberID = ?
+      `,
+      [codePAH, codeWL, categoryID, units, altAsText, updatedDate, updatedBy, partNumberID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Part number no encontrado",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: t("updateSuccess", language) || "Actualizado correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.deletePartNumber = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { partNumberID } = req.params;
+
+    const [result] = await db.query(
+      `
+        DELETE FROM inventorylesly.partnumber_inv
+        WHERE partNumberID = ?
+    `,
+      [partNumberID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Part Number no encontrado.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) || "Part Number eliminado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+// Endpoint de Proveedores
+exports.getSuppliers = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [suppliers] = await db.query(`
+      SELECT 
+        spp.supplierID,
+        spp.brandName,
+        spp.countryID,
+        spp.legalName,
+        spp.docNumber,
+        spp.address,
+        spp.zoli,
+        spp.currencyID,
+        spp.leadTime,
+        spp.shipTerm,
+        spp.creditTerm,
+        spp.contactName,
+        spp.contactTel,
+        spp.emailContact,
+        cr.name AS currencyName
+      FROM inventorylesly.supplier spp 
+      INNER JOIN inventorylesly.currency_inv cr 
+        ON spp.currencyID = cr.currencyID
+      ORDER BY spp.supplierID ASC
+    `);
+
+    const [countries] = await db.query(`
+      SELECT countryID, name, code
+      FROM inventorylesly.country_inv
+      ORDER BY name ASC
+    `);
+
+    const [currencies] = await db.query(`
+      SELECT currencyID, name
+      FROM inventorylesly.currency_inv 
+      ORDER BY currencyID ASC
+    `);
+
+    res.json({
+      suppliers,
+      currencies,
+      countries,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.createSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const {
+      brandName,
+      countryID,
+      legalName,
+      docNumber,
+      address,
+      zoli,
+      currencyID,
+      leadTime,
+      shipTerm,
+      creditTerm,
+      contactName,
+      contactTel,
+      emailContact,
+    } = req.body;
+
+    if (!brandName || !currencyID) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          t("validationRequired", language) ||
+          "Faltan campos obligatorios (Brand Name, Moneda).",
+      });
+    }
+
+    const [createdDate, createdBy] = camposAuditoriaADD(req);
+
+    const [result] = await db.query(
+      `
+      INSERT INTO inventorylesly.supplier (
+            brandName,
+            countryID,
+            legalName,
+            docNumber,
+            address,
+            zoli,
+            currencyID,
+            leadTime,
+            shipTerm,
+            creditTerm,
+            contactName,
+            contactTel,
+            emailContact,
+            createdDate,
+            createdBy
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+
+      `,
+      [
+        brandName,
+        countryID,
+        legalName,
+        docNumber,
+        address,
+        zoli,
+        currencyID,
+        leadTime,
+        shipTerm,
+        creditTerm,
+        contactName,
+        contactTel,
+        emailContact,
+        createdDate,
+        createdBy,
+      ]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      message:
+        t("saveSuccess", language) || "Proveedor guardado correctamente.",
+      supplierID: result.insertId,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      ok: false,
+      message: t("saveError", language) || "Error al guardar el proveedor.",
+    });
+  }
+};
+
+exports.updateSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { supplierID } = req.params;
+    const {
+      brandName,
+      countryID,
+      legalName,
+      docNumber,
+      address,
+      zoli,
+      currencyID,
+      leadTime,
+      shipTerm,
+      creditTerm,
+      contactName,
+      contactTel,
+      emailContact,
+    } = req.body;
+
+    const [updatedDate, updatedBy] = camposAuditoriaUPDATE(req);
+
+    const [result] = await db.query(
+      `
+            UPDATE inventorylesly.supplier
+            SET
+              brandName = ?,
+              countryID = ?,
+              legalName = ?,
+              docNumber = ?,
+              address = ?,
+              zoli = ?,
+              currencyID = ?,
+              leadTime = ?,
+              shipTerm = ?,
+              creditTerm = ?,
+              contactName = ?,
+              contactTel = ?,
+              emailContact = ?,
+              updatedDate = ?,
+              updatedBy = ?
+            WHERE supplierID = ?
+          `,
+      [
+        brandName,
+        countryID,
+        legalName,
+        docNumber,
+        address,
+        zoli,
+        currencyID,
+        leadTime,
+        shipTerm,
+        creditTerm,
+        contactName,
+        contactTel,
+        emailContact,
+        updatedDate,
+        updatedBy,
+        supplierID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Proveedor no encontrado.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("updateSuccess", language) || "Proveedor actualizado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.deleteSupplier = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { supplierID } = req.params;
+    const [result] = await db.query(
+      `
+      DELETE FROM inventorylesly.supplier
+      WHERE supplierID = ?;
+    `,
+      [supplierID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Proveedor no encontrado.",
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) || "Proveedor eliminado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+// Endpoints de Localizaciones
+exports.getLocations = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [locations] = await db.query(`
+      SELECT 
+        lc.locationID,
+        lc.locationcode,
+        lc.warehouseID,
+        w.name AS warehouseName
+      FROM inventorylesly.location_inv lc
+      INNER JOIN inventorylesly.warehouse_inv w ON lc.warehouseID = w.warehouseID
+      ORDER BY lc.locationID ASC
+    `);
+
+    const [warehouses] = await db.query(`
+        
+        select 
+        warehouseID,
+        name
+        from inventorylesly.warehouse_inv;
+
+        `);
+
+    res.json({
+      locations,
+      warehouses,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.createLocation = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { locationcode, warehouseID } = req.body;
+
+    if (!locationcode || !warehouseID) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          t("validationRequired", language) ||
+          "Faltan campos obligatorios (Location Code, Warehouse).",
+      });
+    }
+
+    // const [createdDate, createdBy] = camposAuditoriaADD(req);
+
+    const [result] = await db.query(
+      `
+            INSERT INTO inventorylesly.location_inv (
+                    locationcode,
+                    warehouseID
+                    ) VALUES (?,?)
+        `,
+      [
+        locationcode,
+        warehouseID,
+        // createdDate,
+        // createdBy,
+      ]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      message:
+        t("saveSuccess", language) || "Localización guardada correctamente.",
+      locationID: result.insertId,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      ok: false,
+      message: t("saveError", language) || "Error al guardar la localización.",
+    });
+  }
+};
+
+exports.updateLocation = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { locationID } = req.params;
+    const { locationcode, warehouseID } = req.body;
+
+    const [updatedDate, updatedBy] = camposAuditoriaUPDATE(req);
+
+    const [result] = await db.query(
+      `
+            UPDATE inventorylesly.location_inv
+            SET
+                locationcode = ?,
+                warehouseID = ?,
+                updatedDate = ?,
+                updatedBy = ?
+            WHERE locationID = ?
+        `,
+      [locationcode, warehouseID, updatedDate, updatedBy, locationID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Localización no encontrada.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("updateSuccess", language) ||
+        "Localización actualizada correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.deleteLocation = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { locationID } = req.params;
+
+    const [result] = await db.query(
+      `
+            DELETE FROM inventorylesly.location_inv
+            WHERE locationID = ?
+        `,
+      [locationID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Localización no encontrada.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) || "Localización eliminada correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+exports.getCustomers = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const [customers] = await db.query(`
+    select 
+    cc.customerID,
+    cc.name,
+    cc.countryID,
+    cc.legalName,
+    cc.docName,
+    cc.address,
+    cr.currencyID as currencyName,
+    cc.shipTo,
+    cc.invoceTo,
+    cc.contactName,
+    cc.contactTel,
+    cc.emailContact
+    from inventorylesly.customers_c cc
+    inner join inventorylesly.currency_inv cr on cr.currencyID = cc.currencyID
+    order by customerID asc
+    `);
+
+    const [countries] = await db.query(`
+    select
+    countryID,
+    name,
+    code
+    from inventorylesly.country_inv
+    order by name asc
+    `);
+
+    const [currencies] = await db.query(`
+    select 
+    currencyID,
+    name
+    from inventorylesly.currency_inv
+    order by currencyID asc
+    `);
+
+    res.json({
+      customers,
+      currencies,
+      countries,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.createCustomer = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const {
+      name,
+      countryID,
+      legalName,
+      docName,
+      address,
+      currencyID,
+      shipTo,
+      invoceTo,
+      contactName,
+      contactTel,
+      emailContact,
+    } = req.body;
+
+    if (!name || !currencyID) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          t("validationRequired", language) ||
+          "Faltan campos obligatorios (Name, Moneda).",
+      });
+    }
+
+    const [result] = await db.query(
+      `
+      insert into inventorylesly.customers_c (
+            name,
+            countryID,
+            legalName,
+            docName,
+            address,
+            currencyID,
+            shipTo,
+            invoceTo,
+            contactName,
+            contactTel,
+            emailContact,
+            createdDate,
+            createdBy
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `,
+      [
+        name,
+        countryID,
+        legalName,
+        docName,
+        address,
+        currencyID,
+        shipTo,
+        invoceTo,
+        contactName,
+        contactTel,
+        emailContact,
+        ...camposAuditoriaADD(req),
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      message: t("saveSuccess", language) || "Cliente guardado correctamente.",
+      customerID: result.insertId,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      ok: false,
+      message: t("saveError", language) || "Error al guardar el cliente.",
+    });
+  }
+};
+
+exports.updateCustomer = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { customerID } = req.params;
+
+    const {
+      name,
+      countryID,
+      legalName,
+      docName,
+      address,
+      currencyID,
+      shipTo,
+      invoceTo,
+      contactName,
+      contactTel,
+      emailContact,
+    } = req.body;
+
+    const [updatedDate, updatedBy] = camposAuditoriaUPDATE(req);
+
+    const [result] = await db.query(
+      `
+      
+      update inventorylesly.customers_c
+      set
+      name = ?,     
+      countryID = ?,
+      legalName = ?,
+      docName = ?,
+      address = ?,
+      currencyID = ?,
+      shipTo = ?,
+      invoceTo = ?,
+      contactName = ?,
+      contactTel = ?,
+      emailContact = ?,
+      updatedDate = ?,
+      updatedBy = ?
+      where customerID = ?
+    `,
+      [
+        name,
+        countryID,
+        legalName,
+        docName,
+        address,
+        currencyID,
+        shipTo,
+        invoceTo,
+        contactName,
+        contactTel,
+        emailContact,
+        updatedDate,
+        updatedBy,
+        customerID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Cliente no encontrado.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("updateSuccess", language) || "Cliente actualizado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+exports.deleteCustomer = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { customerID } = req.params;
+
+    const [result] = await db.query(
+      `
+      
+      DELETE FROM inventorylesly.customers_c
+      WHERE customerID = ?
+    `,
+      [customerID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Cliente no encontrado.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) || "Cliente eliminado correctamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+
+// Endpoint de Size de Producción 
+exports.getSizes = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [sizes] = await db.query(`
+      SELECT
+        sizeID,
+        sizeName
+      FROM inventorylesly.sizes_inv
+      WHERE companyID = 1;`);
+    res.json({
+      sizes,
+      message: t("getSuccess", language),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+exports.createSizes = async (req, res) => {
+
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+
+    const { sizeName } = req.body;
+
+    const [result] = await db.query(
+      `
+      INSERT INTO inventorylesly.sizes_inv (sizeName, companyID, createdDate,createdBy)
+      VALUES (?, ?, ?, ?)
+      `,
+      [sizeName, 1, ...camposAuditoriaADD(req), ...camposAuditoriaADD(req)]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      message: t("saveSuccess", language) || "Tamaño guardado correctamente.",
+      sizeID: result.insertId,
+    });
+
+
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      ok: false,
+      message: t("saveError", language) || "Error al guardar el tamaño.",
+    });
+  }
+}
+
+exports.updateSizes = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { sizeID } = req.params;
+    const { sizeName } = req.body;
+
+    const [updatedDate, updatedBy] = camposAuditoriaUPDATE(req);
+
+    const [result] = await db.query(`
+    Update inventorylesly.sizes_inv
+    set
+    sizeName = ?,
+    updatedDate = ?,
+    updatedBy = ?
+    where sizeID = ?
+  `,
+      [sizeName, updatedDate, updatedBy, sizeID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Tamaño no encontrado.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("updateSuccess", language) || "Tamaño actualizado correctamente.",
+    });
+
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+
+}
+
+exports.deleteSizes = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { sizeID } = req.params;
+    const [result] = await db.query(
+      `
+          DELETE FROM inventorylesly.sizes_inv
+          WHERE sizeID = ?;
+        `,
+      [sizeID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: t("notFound", language) || "Tamaño no encontrado.",
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      message:
+        t("deleteSuccess", language) || "Tamaño eliminado correctamente.",
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+}

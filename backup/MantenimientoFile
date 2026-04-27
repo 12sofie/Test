@@ -1,0 +1,562 @@
+import React, { useCallback, useState, useEffect, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Autocomplete } from '@mui/material';
+import {
+  Box,
+  FormControl,
+  InputLabel,
+  Button,
+  Table,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableBody,
+  Typography,
+  TextField,
+  IconButton,
+} from '@mui/material';
+import AddIcon from '@mui/icons-material/Add';
+import DeleteIcon from '@mui/icons-material/Delete';
+import EditIcon from '@mui/icons-material/Edit';
+import 'primeicons/primeicons.css';
+import { ConfirmPopup, confirmPopup } from 'primereact/confirmpopup';
+
+import DataTableWithPagination from './tablecomponent/DataTableWithPagination';
+import { usePartNSupplierEmp } from './hooksMaintenaice/usePartNSupplierEmp';
+
+const ItemCodeSupplierTable = React.memo(
+  ({
+    t,
+    filteredRows,
+    searchInput,
+    setSearchInput,
+    getSupplierName,
+    getPartNumberCode,
+    handleStartEdit,
+    confirmDeleteItemCode,
+    suppliers,
+    partNumbers,
+  }) => {
+
+    const [filterSupplier, setFilterSupplier] = useState(null);
+    const [filterPartNumber, setFilterPartNumber] = useState(null);
+    const [filterItemCode, setFilterItemCode] = useState('');
+    // const [filterDescEN, setFilterDescEN] = useState('');
+
+    const filteredRowsByColumns = useMemo(() => {
+      const itemCodeTxt = filterItemCode.trim().toLowerCase();
+      // const descEnTxt = filterDescEN.trim().toLowerCase();
+
+      return (filteredRows || []).filter((row) => {
+        if (filterSupplier?.supplierID && row.supplierID !== filterSupplier.supplierID) return false;
+        if (filterPartNumber?.partNumberID && row.partNumberID !== filterPartNumber.partNumberID) return false;
+
+        if (itemCodeTxt && (row.itemCodeSupplier || '').toLowerCase() !== itemCodeTxt) return false;
+        // if (descEnTxt && !(row.descriptionEN || '').toLowerCase().includes(descEnTxt)) return false;
+
+        return true;
+      });
+    }, [filteredRows, filterSupplier, filterPartNumber, filterItemCode]);
+
+    const columns = [
+      {
+        id: 'itemCodeSupplier',
+        label: 'Item Code',
+        nowrap: true,
+        filterElement: (
+          <TextField
+            size="small"
+            value={filterItemCode}
+            onChange={(e) => setFilterItemCode(e.target.value)}
+            placeholder="Filtrar..."
+            fullWidth
+          />
+        ),
+        render: (row) => <span style={{ fontWeight: 600 }}>{row.itemCodeSupplier}</span>,
+      },
+      {
+        id: 'supplier',
+        label: t('supplier'),
+        nowrap: true,
+        filterElement: (
+          <Autocomplete
+            size="small"
+            options={suppliers || []}
+            value={filterSupplier}
+            onChange={(e, v) => setFilterSupplier(v)}
+            getOptionLabel={(o) => o?.brandName || o?.legalName || ''}
+            renderInput={(params) => <TextField {...params} placeholder="Filtrar..." />}
+            isOptionEqualToValue={(opt, val) => opt.supplierID === val.supplierID}
+          />
+        ),
+        render: (row) => getSupplierName(row.supplierID),
+      },
+      {
+        id: 'partNumber',
+        label: 'Part Number',
+        nowrap: true,
+        filterElement: (
+          <Autocomplete
+            size="small"
+            options={partNumbers || []}
+            value={filterPartNumber}
+            onChange={(e, v) => setFilterPartNumber(v)}
+            getOptionLabel={(o) => o?.codePAH || ''}
+            renderInput={(params) => <TextField {...params} placeholder="Filtrar..." />}
+            isOptionEqualToValue={(opt, val) => opt.partNumberID === val.partNumberID}
+          />
+        ),
+        render: (row) => getPartNumberCode(row.partNumberID),
+      },
+      {
+        id: 'descriptionEN',
+        label: 'Desc. EN',
+        render: (row) => row.descriptionEN,
+      },
+      { id: 'descriptionES', label: 'Desc. ES', render: (row) => row.descriptionES },
+      { id: 'fabricContent', label: 'Fabric', render: (row) => row.fabricContent },
+      { id: 'hts', label: 'HTS', render: (row) => row.hts },
+      { id: 'width', label: t('width'), render: (row) => row.width },
+      { id: 'weight', label: t('weight'), render: (row) => row.weight },
+    ];
+
+
+
+
+    return (
+      <>
+        <DataTableWithPagination
+          title={t('item_Code_Supplier')}
+          columns={columns}
+          rows={filteredRowsByColumns}
+          getRowId={(row) =>
+            `${row.itemCodeSupplier}-${row.partNumberID}`
+          }
+          headerRight={
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+              <TextField
+                size="small"
+                label={t('search')}
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                sx={{ width: { xs: '100%', sm: 260 } }}
+              />
+              
+            </Box>
+          }
+          renderActions={(row) => {
+            return (
+              <Box sx={{ display: 'flex', gap: 1 }}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="info"
+                  sx={{ minWidth: 36 }}
+                  onClick={() => handleStartEdit(row)}
+                >
+                  <EditIcon fontSize="small" />
+                </Button>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="error"
+                  sx={{ minWidth: 36 }}
+                  onClick={(e) => confirmDeleteItemCode(e, row)}
+                >
+                  <DeleteIcon fontSize="small" />
+                </Button>
+              </Box>
+            );
+          }}
+        />
+        <ConfirmPopup />
+      </>
+    );
+  }
+);
+
+const MantenimientoFile = () => {
+  const { t } = useTranslation();
+  const [searchInput, setSearchInput] = useState('');
+
+  const {
+    suppliers,
+    partNumbers,
+    selectedSupplier,
+    setSelectedSupplier,
+    selectedPartNumber,
+    setSelectedPartNumber,
+
+    itemCodeSupplier,
+    setItemCodeSupplier,
+    descriptionES,
+    setDescriptionES,
+    descriptionEN,
+    setDescriptionEN,
+    fabricContent,
+    setFabricContent,
+    hts,
+    setHts,
+    width,
+    setWidth,
+    weight,
+    setWeight,
+
+    items,
+    errors,
+    saving,
+
+    editItemCode,
+    loadingEdit,
+    selectedItemIndex,
+
+    // searchItemCode,
+    setSearchItemCode,
+    handleSelectItemRow,
+
+    handleAddToList,
+    handleRemoveItem,
+    handleSaveAll,
+    canAddRow,
+    getSupplierName,
+    getPartNumberCode,
+    handleStartEdit,
+    handleCancelEdit,
+    handleSaveEdit,
+    handleDeleteItemCode,
+    filteredRows,
+  } = usePartNSupplierEmp();
+
+  const confirmDeleteItemCode = useCallback(
+    (event, row) => {
+      confirmPopup({
+        target: event.currentTarget,
+        message:
+          t('messageConfirmation') ||
+          '¿Está seguro de eliminar este Item Code?',
+        icon: 'pi pi-info-circle',
+        defaultFocus: 'reject',
+        acceptClassName: 'p-button-danger',
+        accept: () => handleDeleteItemCode(row.itemCodeSupplier),
+      });
+    },
+    [t, handleDeleteItemCode]
+  );
+
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setSearchItemCode(searchInput);
+    }, 250);
+
+    return () => clearTimeout(id);
+  }, [searchInput, setSearchItemCode]);
+
+  return (
+    <Box p={3} sx={{ width: '100%', boxSizing: 'border-box' }}>
+      <Box
+        display="flex"
+        gap={3}
+        flexDirection={{ xs: 'column', md: 'row' }}
+        flexWrap="wrap"
+      >
+        <Box flex={{ xs: '1 1 100%', md: 1.2 }} minWidth={0}>
+          <Typography variant="subtitle1" mb={2}>
+            {t('data')}:
+          </Typography>
+
+          <Box
+            display="flex"
+            gap={2}
+            mb={2}
+            alignItems="center"
+            flexWrap="wrap"
+          >
+            <FormControl
+              sx={{ minWidth: { xs: '100%', sm: 220 } }}
+              size="small"
+              error={!!errors.partNumber}
+            >
+              <InputLabel id="partnumber-label"></InputLabel>
+              <Autocomplete
+                size="small"
+                sx={{ minWidth: { xs: '100%', sm: 220 } }}
+                options={partNumbers}
+                getOptionLabel={(option) => option.codePAH || ''}
+                value={
+                  partNumbers.find(
+                    (p) => p.partNumberID === selectedPartNumber
+                  ) || null
+                }
+                onChange={(event, newValue) => {
+                  setSelectedPartNumber(
+                    newValue ? newValue.partNumberID : ''
+                  );
+                }}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="PartNumber"
+                    error={!!errors.partNumber}
+                    helperText={errors.partNumber || ''}
+                  />
+                )}
+              />
+            </FormControl>
+
+            <FormControl
+              sx={{ minWidth: { xs: '100%', sm: 220 } }}
+              size="small"
+              error={!!errors.supplier}
+            >
+              <InputLabel id="supplier-label"></InputLabel>
+              <Autocomplete
+                size="small"
+                sx={{ minWidth: { xs: '100%', sm: 220 } }}
+                options={suppliers}
+                getOptionLabel={(option) =>
+                  option.brandName || option.legalName || ''
+                }
+                value={
+                  suppliers.find(
+                    (s) => s.supplierID === selectedSupplier
+                  ) || null
+                }
+                onChange={(event, newValue) => {
+                  setSelectedSupplier(
+                    newValue ? newValue.supplierID : ''
+                  );
+                }}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label={t('supplier')}
+                    error={!!errors.supplier}
+                    helperText={errors.supplier || ''}
+                  />
+                )}
+              />
+            </FormControl>
+
+            <IconButton
+              onClick={handleAddToList}
+              disabled={!canAddRow}
+              sx={{
+                borderRadius: 1,
+                border: '1px solid #ccc',
+                bgcolor: canAddRow ? 'primary.main' : 'grey.200',
+                color: canAddRow ? '#fff' : 'text.disabled',
+                '&:hover': {
+                  bgcolor: canAddRow ? 'primary.dark' : 'grey.200',
+                },
+              }}
+            >
+              <AddIcon />
+            </IconButton>
+          </Box>
+
+          <Box
+            sx={{
+              borderRadius: 1,
+              overflow: 'hidden',
+              width: '100%',
+            }}
+          >
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>PartNumber</TableCell>
+                  <TableCell>{t('supplier')}:</TableCell>
+                  <TableCell>Item Code</TableCell>
+                  <TableCell>Desc. EN</TableCell>
+                  <TableCell align="center" sx={{ width: 60 }} />
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {items.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={5}>
+                      {t('there_are_no_records_yet')}:
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  items.map((row, index) => (
+                    <TableRow
+                      key={`${row.supplierID}-${row.partNumberID}-${index}`}
+                      hover
+                      onClick={() => handleSelectItemRow(row, index)}
+                      selected={selectedItemIndex === index}
+                      sx={{
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <TableCell>{row.partNumberLabel}</TableCell>
+                      <TableCell>{row.supplierName}</TableCell>
+                      <TableCell>{row.itemCodeSupplier}</TableCell>
+                      <TableCell>{row.descriptionEN}</TableCell>
+                      <TableCell align="center">
+                        <IconButton
+                          size="small"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveItem(index);
+                          }}
+                        >
+                          <DeleteIcon fontSize="small" />
+                        </IconButton>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </Box>
+
+          <Box mt={1} sx={{
+            display: 'flex',
+            justifyContent: 'flex-end', // o 'flex-end' si lo querés a la derecha
+            mt: 2,
+          }}>
+            <Button
+              type="button"
+              variant="contained"
+              color="info"
+              onClick={editItemCode ? handleSaveEdit : handleSaveAll}
+              disabled={
+                editItemCode
+                  ? loadingEdit
+                  : items.length === 0 || saving
+              }
+              sx={{
+                minWidth: 160,
+                alignSelf: { xs: 'stretch', md: 'center' },
+              }}
+            >
+              {editItemCode ? <EditIcon /> : <AddIcon />}
+            </Button>
+          </Box>
+        </Box>
+
+        <Box
+          flex={{ xs: '1 1 100%', md: 1 }}
+          mt={{ xs: 2, md: 0 }}
+          minWidth={0}
+        >
+          <Typography variant="subtitle1" mb={2}>
+            {t('detail')}:
+          </Typography>
+
+          <Box display="flex" flexDirection="column" gap={2}>
+            <Box
+              display="flex"
+              gap={2}
+              flexWrap="wrap"
+              flexDirection={{ xs: 'column', md: 'row' }}
+            >
+              <TextField
+                label="Item Code Supplier"
+                size="small"
+                fullWidth
+                value={itemCodeSupplier}
+                onChange={(e) => setItemCodeSupplier(e.target.value)}
+                error={!!errors.itemCodeSupplier}
+                helperText={errors.itemCodeSupplier || ''}
+              />
+              <TextField
+                label={t('descriptionEs')}
+                size="small"
+                fullWidth
+                value={descriptionES}
+                onChange={(e) => setDescriptionES(e.target.value)}
+              />
+            </Box>
+
+            <Box
+              display="flex"
+              gap={2}
+              flexWrap="wrap"
+              flexDirection={{ xs: 'column', md: 'row' }}
+            >
+              <TextField
+                label={t('descriptionEn')}
+                size="small"
+                fullWidth
+                value={descriptionEN}
+                onChange={(e) => setDescriptionEN(e.target.value)}
+                error={!!errors.descriptionEN}
+                helperText={errors.descriptionEN || ''}
+              />
+              <TextField
+                label="Fabric Content"
+                size="small"
+                fullWidth
+                value={fabricContent}
+                onChange={(e) => setFabricContent(e.target.value)}
+              />
+            </Box>
+
+            <Box
+              display="flex"
+              gap={2}
+              flexWrap="wrap"
+              flexDirection={{ xs: 'column', md: 'row' }}
+            >
+              <TextField
+                label="HTS"
+                size="small"
+                fullWidth
+                value={hts}
+                onChange={(e) => setHts(e.target.value)}
+              />
+              <TextField
+                label={t('width')}
+                size="small"
+                fullWidth
+                value={width}
+                onChange={(e) => setWidth(e.target.value)}
+              />
+              <TextField
+                label={t('weight')}
+                size="small"
+                fullWidth
+                value={weight}
+                onChange={(e) => setWeight(e.target.value)}
+              />
+
+
+
+              {editItemCode && (
+                <Box mt={1}>
+                  <Button
+                    variant="outlined"
+                    color="error"
+                    onClick={handleCancelEdit}
+                    sx={{ minWidth: 160 }}
+                  >
+                    {t('cancel') || 'Cancelar edición'}
+                  </Button>
+                </Box>
+              )}
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+
+      <Box mt={4}>
+        <ItemCodeSupplierTable
+          t={t}
+          filteredRows={filteredRows}
+          searchInput={searchInput}
+          setSearchInput={setSearchInput}
+          getSupplierName={getSupplierName}
+          getPartNumberCode={getPartNumberCode}
+          handleStartEdit={handleStartEdit}
+          confirmDeleteItemCode={confirmDeleteItemCode}
+          suppliers={suppliers}
+          partNumbers={partNumbers}
+        />
+      </Box>
+    </Box>
+  );
+};
+
+export default MantenimientoFile;

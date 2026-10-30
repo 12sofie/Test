@@ -1,0 +1,5891 @@
+const db = require("../config/db");
+const {
+  camposAuditoriaUPDATE,
+  camposAuditoriaADD,
+} = require("../helpers/columnasAuditoria");
+const { isValidString, capitalizar } = require("../helpers/validator");
+const { printPermissionTicket } = require("./thermalPrinterController");
+const getUserIdFromToken = require("../helpers/getUserIdFromToken");
+
+const ExcelJS = require("exceljs");
+const enviarCorreo = require("../helpers/sendEmail");
+const { io } = require("../app");
+
+const dayjs = require("dayjs");
+const customParseFormat = require("dayjs/plugin/customParseFormat");
+const isoWeek = require("dayjs/plugin/isoWeek");
+const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+const isBetween = require("dayjs/plugin/isBetween.js");
+const minMax = require("dayjs/plugin/minMax");
+const { t } = require("i18next");
+const { idPermissionCollective } = require("../helpers/valuesStatic");
+
+dayjs.extend(isBetween);
+dayjs.extend(minMax);
+require("dayjs/locale/es");
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.extend(isoWeek);
+dayjs.extend(customParseFormat);
+
+// Función para obtener tipos de permisos y lista de empleados que marcaron hoy
+exports.getPermissionData = async (req, res) => {
+  try {
+    const [permissionResults] = await db.query(
+      "SELECT permissionTypeID, permissionTypeName FROM permissiontype_emp"
+    );
+    //const currentDate = dayjs().tz("America/Tegucigalpa").format("YYYY-MM-DD");
+    // const [employeeResults] = await db.query(
+    //   `SELECT DISTINCT
+    //     e.employeeID,
+    //     CONCAT(e.employeeID, ' - ', e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName) AS fullName
+    //   FROM
+    //       employees_emp e
+    //       INNER JOIN h_attendance_emp a ON e.employeeID = a.employeeID
+    //   WHERE
+    //       a.date = ?
+    //       AND NOT EXISTS (
+    //           SELECT 1
+    //           FROM dispatching_emp d
+    //     WHERE d.employeeID = e.employeeID
+    //       AND d.date = ?
+    // );`,
+    //   [currentDate, currentDate]
+    // );
+
+    let currentTime = dayjs().format("HH:mm:ss");
+
+    const [shiftDetail] = await db.query(
+      `
+        SELECT
+          s.shiftID, ds.day, s.shiftName, ds.startTime, ds.endTime
+        FROM detailsshift_emp ds
+        INNER JOIN shifts_emp s ON ds.shiftID = s.shiftID
+        WHERE s.companyID = 1
+          AND ds.day = '${dayjs().locale("en").format("dddd")}'
+          AND (
+          (ds.startTime < ds.endTime AND '${currentTime}' BETWEEN ds.startTime AND ds.endTime)
+          OR
+          (ds.startTime > ds.endTime AND
+          ('${currentTime}' >= ds.startTime OR '${currentTime}' <= ds.endTime))
+        )
+      `
+    );
+
+    res.json({
+      permissions: permissionResults,
+      currentShift: shiftDetail.length > 0 ? shiftDetail[0] : null,
+    });
+  } catch (err) {
+    console.error("Error fetching permission data:", err);
+    res.status(500).json({
+      message: "Error al cargar datos iniciales para permisos",
+      error: err.message,
+    });
+  }
+};
+
+// Función para obtener todos los permisos registrados
+exports.getAllPermissions = async (req, res) => {
+  try {
+    const [permissionResults] = await db.query(`
+      SELECT
+        pa.*,
+        CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, e.codeEmployee,
+        p.permissionTypeName, j.jobName, ua.username AS approvedByUsername,
+        CONCAT(e_aprobador.firstName, ' ', e_aprobador.lastName) AS approvedByFullName,
+        CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS createdBy, pa.createdDate,
+        att.entryTime AS attendanceEntry
+      FROM
+        permissionattendance_emp pa
+        INNER JOIN permissiontype_emp p ON p.permissionTypeID = pa.permissionTypeID
+        INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+        INNER JOIN jobs_emp j ON e.jobID = j.jobID 
+        LEFT JOIN users_us ua ON ua.userID = pa.approvedBy
+        LEFT JOIN employees_emp e_aprobador ON e_aprobador.employeeID = ua.employeeID
+        LEFT JOIN users_us uc ON uc.userID = pa.createdBy 
+        LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID 
+        LEFT JOIN (
+          SELECT employeeID, date, MIN(entryTime) AS entryTime
+          FROM h_attendance_emp
+          GROUP BY employeeID, date
+        ) att ON pa.date = att.date AND pa.employeeID = att.employeeID
+      WHERE pa.date BETWEEN '${dayjs().format(
+      "YYYY-MM-DD"
+    )}' AND '${dayjs().format("YYYY-MM-DD")}'
+      ORDER BY pa.permissionID DESC;
+    `);
+    res.json(permissionResults);
+  } catch (err) {
+    console.error("Error fetching all permissions:", err);
+    res.status(500).json({
+      message: "Error al cargar todos los permisos",
+      error: err.message,
+    });
+  }
+};
+
+// Función para obtener permisos con filtros
+exports.getPermissionsWithFilter = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    let filters = [];
+    let params = [];
+    if (isValidString(startDate)) {
+      filters.push("pa.date >= ?");
+      params.push(startDate);
+    }
+    if (isValidString(endDate)) {
+      filters.push("pa.date <= ?");
+      params.push(endDate);
+    }
+    const whereClause =
+      filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+    const [permissionResults] = await db.query(
+      `
+      SELECT
+        pa.*,
+        CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, e.codeEmployee,
+        p.permissionTypeName, j.jobName, ua.username AS approvedByUsername,
+        CONCAT(e_aprobador.firstName, ' ', e_aprobador.lastName) AS approvedByFullName, isApproved,
+        CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS createdBy, pa.createdDate,
+        att.entryTime AS attendanceEntry
+      FROM
+        permissionattendance_emp pa
+        INNER JOIN permissiontype_emp p ON p.permissionTypeID = pa.permissionTypeID
+        INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+        INNER JOIN jobs_emp j ON e.jobID = j.jobID
+        LEFT JOIN users_us ua ON ua.userID = pa.approvedBy
+        LEFT JOIN employees_emp e_aprobador ON e_aprobador.employeeID = ua.employeeID
+        LEFT JOIN users_us uc ON uc.userID = pa.createdBy
+        LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID
+        LEFT JOIN (
+          SELECT employeeID, date, MIN(entryTime) AS entryTime
+          FROM h_attendance_emp
+          GROUP BY employeeID, date
+        ) att ON pa.date = att.date AND pa.employeeID = att.employeeID
+      ${whereClause}
+      ORDER BY pa.date ASC, e.codeEmployee ASC, pa.permissionID ASC;
+      `,
+      params
+    );
+    res.json(permissionResults);
+  } catch (err) {
+    console.error("Error fetching permissions with filter:", err);
+    res.status(500).json({
+      message: "Error al cargar permisos con filtro",
+      error: err.message,
+    });
+  }
+};
+
+// Endpoint para exportar permisos a Excel del modal de Permissions
+exports.exportPermissionsToExcel = async (req, res) => {
+   
+  try {
+    const APP_TZ = "America/Tegucigalpa";
+    const { date, startDate, endDate } = req.query;
+   
+    const toSQLDate = (d) => dayjs(d).format("YYYY-MM-DD");
+
+    // --- Construcción de filtros dinámicos ---
+    const filters = ["pa.isApproved = 1"];
+    const params = [];
+
+    if (date) {
+      filters.push("pa.date = ?");
+      params.push(toSQLDate(date));
+    } else if (startDate && endDate) {
+      filters.push("pa.date BETWEEN ? AND ?");
+      params.push(toSQLDate(startDate), toSQLDate(endDate));
+    } else if (startDate && !endDate) {
+      filters.push("pa.date = ?");
+      params.push(toSQLDate(startDate));
+    } else if (!startDate && endDate) {
+      filters.push("pa.date = ?");
+      params.push(toSQLDate(endDate));
+    } else {
+      // Sin parámetros: hoy
+      const today = dayjs().format("YYYY-MM-DD");
+      filters.push("pa.date = ?");
+      params.push(today);
+    }
+
+    const whereClause = `WHERE ${filters.join(" AND ")}`;
+
+    // === QUERY SQL ===
+    const query = `
+      SELECT
+        pa.permissionID,
+        e.codeEmployee,
+        pa.date AS attendance,
+        CONCAT(
+          e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName, ' ', e.secondLastName
+        ) AS employeeName,
+        pt.payrollName AS payrollName,
+        pa.createdDate AS createdDate,
+        att.entryTime AS attendanceEntry,
+        pa.exitPermission,
+        pa.entryPermission,
+        ROUND(TIMESTAMPDIFF(MINUTE, pa.exitPermission, pa.entryPermission) / 60, 2) AS permisoHours,
+        p.permissionTypeName,
+
+         CASE
+         WHEN p.permissionTypeName = 'Otro' AND pa.comment <> ''
+            THEN CONCAT('Otro - ', pa.comment)
+            ELSE p.permissionTypeName
+        END AS permissionTypeDisplay,
+  
+        pa.request,
+        CONCAT(e_creador.firstName, ' ', COALESCE(e_creador.middleName, ''), ' ', e_creador.lastName) AS createdBy,
+        CONCAT(e_aprobador.firstName, ' ', COALESCE(e_aprobador.middleName, ''), ' ', e_aprobador.lastName) AS approvedBy
+      FROM permissionattendance_emp pa
+      INNER JOIN permissiontype_emp p ON p.permissionTypeID = pa.permissionTypeID
+      INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+      INNER JOIN jobs_emp j ON e.jobID = j.jobID
+      INNER JOIN payrolltype_emp pt ON pt.payrollTypeID = e.payrollTypeID
+      LEFT JOIN users_us ua ON ua.userID = pa.approvedBy
+      LEFT JOIN employees_emp e_aprobador ON e_aprobador.employeeID = ua.employeeID
+      LEFT JOIN users_us uc ON uc.userID = pa.createdBy
+      LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID
+      LEFT JOIN (
+        SELECT employeeID, date, MIN(entryTime) AS entryTime
+        FROM h_attendance_emp
+        GROUP BY employeeID, date
+      ) att ON pa.date = att.date AND pa.employeeID = att.employeeID
+      ${whereClause}
+      ORDER BY pa.date ASC, e.codeEmployee ASC, pa.permissionID ASC;
+    `;
+
+    const [results] = await db.query(query, params);
+
+
+    // === CREACIÓN DE EXCEL ===
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Permisos");
+
+    // Helpers para formato
+    const formatDate = (d) => (d ? dayjs(d).format("DD-MM-YYYY") : "-");
+    const formatTime = (t) => {
+      if (!t) return "-";
+      const parsed = dayjs(t, ["HH:mm:ss", "YYYY-MM-DD HH:mm:ss"], true);
+      return parsed.isValid() ? parsed.format("hh:mm A") : "-";
+    };
+
+    // 1) Agrupar resultados por (empleado, fecha)
+    const grouped = {};
+    for (const row of results) {
+      const key = `${row.codeEmployee || ""}_${row.attendance || ""}`;
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(row);
+    }
+
+    // 2) Máximo de permisos
+    const maxPermisos =
+      Object.keys(grouped).length > 0
+        ? Math.max(...Object.values(grouped).map((arr) => arr.length))
+        : 0;
+
+    // 3) Columnas base
+    const baseColumns = [
+      { header: "Ítem", key: "item", width: 8 },
+      { header: "Código", key: "codeEmployee", width: 10 },
+      { header: "Empleado", key: "employeeName", width: 30 },
+      { header: "Planilla", key: "payrollName", width: 15 },
+      { header: "Fecha", key: "permissionDate", width: 14 },
+
+      // { header: "Fecha Creación", key: "createdDate", width: 18 },
+      { header: "Entrada Asistencia", key: "attendanceEntry", width: 18 },
+    ];
+
+    // 4) Bloques dinámicos de permisos
+    const permisoBlock = (i) => [
+      { header: `Salida Permiso ${i}`, key: `exitPermission${i}`, width: 15 },
+      { header: `Entrada Permiso ${i}`, key: `entryPermission${i}`, width: 15 },
+      { header: `Tiempo Permiso`, key: `permisoHours${i}`, width: 16 },
+      { header: `Pago`, key: `pago${i}`, width: 10 },
+      { header: `Tipo Permiso`, key: `tipoPermiso${i}`, width: 20 },
+      { header: `Solicitud`, key: `solicitud${i}`, width: 12 },
+      { header: `Creado Por`, key: `creadoPor${i}`, width: 22 },
+      { header: `Aprobado Por`, key: `aprobadoPor${i}`, width: 22 },
+    ];
+
+    // 5) Definir columnas
+    let columns = [...baseColumns];
+    for (let i = 1; i <= maxPermisos; i++) {
+      columns = columns.concat(permisoBlock(i));
+    }
+    worksheet.columns = columns;
+
+    // 6) Header agrupado
+    if (maxPermisos > 0) {
+      worksheet.insertRow(1, []);
+      let startCol = baseColumns.length + 1;
+      for (let i = 1; i <= maxPermisos; i++) {
+        const endCol = startCol + 8 - 1;
+        worksheet.mergeCells(1, startCol, 1, endCol);
+        const cell = worksheet.getCell(1, startCol);
+        cell.value = `Permiso ${i}`;
+        cell.font = { bold: true, color: { argb: "FFFFFF" } };
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "4F81BD" },
+        };
+        for (let c = startCol; c <= endCol; c++) {
+          worksheet.getCell(1, c).border = {
+            top: { style: "thin" },
+            left: { style: "thin" },
+            bottom: { style: "thin" },
+            right: { style: "thin" },
+          };
+        }
+        startCol = endCol + 1;
+      }
+    }
+
+    // 7) Encabezados
+    const headerRowIndex = maxPermisos > 0 ? 2 : 1;
+    const headerRow = worksheet.getRow(headerRowIndex);
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "366092" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    });
+
+    // 8) Llenar filas
+    let rowIndex = 0;
+    const totalColumns = worksheet.columnCount;
+    for (const permisos of Object.values(grouped)) {
+      rowIndex += 1;
+
+      const base = {
+        item: rowIndex,
+        codeEmployee: permisos[0].codeEmployee
+          ? Number(permisos[0].codeEmployee)
+          : "-",
+        employeeName: permisos[0].employeeName,
+        payrollName: permisos[0].payrollName || "-",
+        permissionDate: formatDate(permisos[0].attendance),
+        // createdDate: formatDate(permisos[0].createdDate),
+        attendanceEntry: formatTime(permisos[0].attendanceEntry),
+      };
+
+      for (let i = 1; i <= maxPermisos; i++) {
+        base[`exitPermission${i}`] = "-";
+        base[`entryPermission${i}`] = "-";
+        base[`permisoHours${i}`] = "-";
+        base[`pago${i}`] = "";
+        base[`tipoPermiso${i}`] = "-";
+        base[`solicitud${i}`] = "-";
+        base[`creadoPor${i}`] = "-";
+        base[`aprobadoPor${i}`] = "-";
+      }
+
+      permisos.forEach((p, i) => {
+        const idx = i + 1;
+        base[`exitPermission${idx}`] = p.exitPermission
+          ? formatTime(p.exitPermission)
+          : "-";
+        base[`entryPermission${idx}`] = p.entryPermission
+          ? formatTime(p.entryPermission)
+          : "-";
+        base[`permisoHours${idx}`] =
+          typeof p.permisoHours === "number"
+            ? p.permisoHours
+            : p.permisoHours
+              ? Number(p.permisoHours)
+              : "-";
+        base[`tipoPermiso${idx}`] =
+          p.permissionTypeDisplay || p.permissionTypeName || "-";
+        base[`solicitud${idx}`] = p.request ? "Solicitado" : "Diferido";
+        base[`creadoPor${idx}`] = p.createdBy || "-";
+        base[`aprobadoPor${idx}`] = p.approvedBy || "-";
+      });
+      const excelRow = worksheet.addRow(base);
+      for (let c = 1; c <= totalColumns; c++) {
+        const cell = excelRow.getCell(c);
+        cell.border = {
+          top: { style: "thin" },
+          left: { style: "thin" },
+          bottom: { style: "thin" },
+          right: { style: "thin" },
+        };
+        cell.alignment = { vertical: "middle" };
+      }
+    }
+
+    // 9) Descargar archivo
+    const fileLabel = date
+      ? toSQLDate(date)
+      : startDate && endDate
+        ? `${toSQLDate(startDate)}_a_${toSQLDate(endDate)}`
+        : dayjs().format("YYYY-MM-DD");
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=permisos_${fileLabel}.xlsx`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar permisos:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor al exportar permisos",
+      error: error.message,
+    });
+  }
+};
+
+
+// Endpoint para exportar reporte diario de permisos a Excel del modal de Record Attendance
+//modal de permission
+exports.exportPermissionReportExcel = async (req, res) => {
+  console.log(">>> ENTRO A exportPermissionReportExcel <<<");
+  try {
+    const { nummWeek, status, startDate: qStart, endDate: qEnd } = req.query;
+
+    const isValidDate = (v) => dayjs(v, "YYYY-MM-DD", true).isValid();
+
+    let startDate, endDate;
+
+    // 1) Si viene rango -> usarlo
+    if (qStart || qEnd) {
+      const s = qStart || qEnd;
+      const e = qEnd || qStart;
+
+      if (!isValidDate(s) || !isValidDate(e)) {
+        return res.status(400).json({
+          success: false,
+          message: "Fechas inválidas. Usa formato YYYY-MM-DD en startDate/endDate.",
+        });
+      }
+
+      startDate = dayjs(s).format("YYYY-MM-DD");
+      endDate = dayjs(e).format("YYYY-MM-DD");
+
+      // asegurar orden
+      if (dayjs(endDate).isBefore(dayjs(startDate))) {
+        const tmp = startDate;
+        startDate = endDate;
+        endDate = tmp;
+      }
+    }
+    // 2) Si NO viene rango, usar semana (compatibilidad)
+    else if (nummWeek) {
+      startDate = dayjs().isoWeek(Number(nummWeek)).startOf("isoWeek").format("YYYY-MM-DD");
+      endDate = dayjs().isoWeek(Number(nummWeek)).endOf("isoWeek").format("YYYY-MM-DD");
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "Falta startDate/endDate (o nummWeek).",
+      });
+    }
+
+    if (status == null) {
+      return res.status(400).json({ success: false, message: "Falta status." });
+    }
+
+
+    const LUNCH_HOURS = 0.75;
+
+    // ===== Helpers de tiempo =====
+    const getTimeString = (value) => {
+      if (!value) return null;
+      if (typeof value === "string") {
+        const parts = value.split(" ");
+        return parts[parts.length - 1]; // HH:mm:ss
+      }
+      return dayjs(value).format("HH:mm:ss");
+    };
+
+    const timeToMinutes = (value) => {
+      const t = getTimeString(value);
+      if (!t) return null;
+      const [hStr, mStr, sStr] = t.split(":");
+      const h = parseInt(hStr ?? "0", 10);
+      const m = parseInt(mStr ?? "0", 10);
+      // const s = parseInt(sStr ?? "0", 10);
+      return h * 60 + m;
+    };
+
+    const diffHours = (start, end) => {
+      const ms = timeToMinutes(start);
+      const me = timeToMinutes(end);
+      if (ms == null || me == null) return 0;
+      let diffMin = me - ms;
+      if (diffMin < 0) diffMin += 24 * 60; // cruces de medianoche
+      return diffMin / 60;
+    };
+
+    // Detecta turno nocturno si la jornada cruza medianoche (ej: 18:00 -> 03:00)
+    const isNightShiftByTimes = (startTime, endTime) => {
+      const s = timeToMinutes(startTime);
+      const e = timeToMinutes(endTime);
+      if (s == null || e == null) return false;
+      return e <= s; // cruza medianoche => noche
+    };
+
+    const formatDate = (d) => (d ? dayjs(d).format("DD-MM-YYYY") : "-");
+    const formatTime = (t) => {
+      if (!t) return "-";
+      const parsed = dayjs(getTimeString(t), "HH:mm:ss", true);
+      return parsed.isValid() ? parsed.format("hh:mm A") : "-";
+    };
+
+    // Helpers de intervalos (en minutos)
+    const mergeIntervals = (intervals) => {
+      if (!intervals.length) return [];
+      const sorted = intervals
+        .slice()
+        .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      const result = [];
+      let [curStart, curEnd] = sorted[0];
+      for (let i = 1; i < sorted.length; i++) {
+        const [s, e] = sorted[i];
+        if (s <= curEnd) {
+          if (e > curEnd) curEnd = e;
+        } else {
+          result.push([curStart, curEnd]);
+          curStart = s;
+          curEnd = e;
+        }
+      }
+      result.push([curStart, curEnd]);
+      return result;
+    };
+
+    // Devuelve segmentos "hueco" dentro de [segStart, segEnd] que NO están cubiertos por intervals
+    const subtractIntervals = (intervals, segStart, segEnd) => {
+      if (segStart == null || segEnd == null || segEnd <= segStart) return [];
+      const merged = mergeIntervals(intervals);
+      const gaps = [];
+      let cursor = segStart;
+
+      for (const [s, e] of merged) {
+        if (e <= segStart) continue;
+        if (s >= segEnd) break;
+
+        const cs = Math.max(s, segStart);
+        const ce = Math.min(e, segEnd);
+
+        if (cs > cursor) gaps.push([cursor, cs]);
+        cursor = Math.max(cursor, ce);
+      }
+
+      if (cursor < segEnd) gaps.push([cursor, segEnd]);
+      return gaps;
+    };
+
+    const hoursRange = (start, end, hasLunch, lunchHours = LUNCH_HOURS) => {
+      const h = diffHours(start, end);
+      const lunch = hasLunch ? lunchHours : 0;
+      return Math.max(h - lunch, 0);
+    };
+
+    const payLabel = (v) => (Number(v) === 1 ? "Con goce" : "Sin goce");
+
+    const totalMinutes = (intervals) => {
+      const merged = mergeIntervals(intervals);
+      return merged.reduce((sum, [s, e]) => sum + (e - s), 0);
+    };
+
+    const coverageInSegment = (intervals, segStart, segEnd) => {
+      if (segStart == null || segEnd == null || segEnd <= segStart) return 0;
+      const clipped = [];
+      for (const [s, e] of intervals) {
+        const cs = Math.max(segStart, s);
+        const ce = Math.min(segEnd, e);
+        if (ce > cs) clipped.push([cs, ce]);
+      }
+      return totalMinutes(clipped);
+    };
+
+    // ===== Rango de fecha de la semana (L-D) =====
+    // const startDate = dayjs()
+    //   .isoWeek(nummWeek)
+    //   .startOf("isoWeek")
+    //   .format("YYYY-MM-DD");
+    // const endDate = dayjs()
+    //   .isoWeek(nummWeek)
+    //   .endOf("isoWeek")
+    //   .format("YYYY-MM-DD");
+
+    // ============================================
+    // 1) Rango total de permisos del día (dayPerm)
+    // ============================================
+    const [dayPermRows] = await db.query(
+      `
+      SELECT
+        p2.employeeID,
+        DATE(p2.date) AS d,
+        MIN(p2.exitPermission)  AS day_perm_min_start,
+        MAX(p2.entryPermission) AS day_perm_max_end
+      FROM permissionattendance_emp p2
+      INNER JOIN employees_emp e ON e.employeeID = p2.employeeID
+      WHERE p2.date BETWEEN ? AND ?
+        AND p2.isApproved = 1
+       
+      GROUP BY p2.employeeID, DATE(p2.date);
+      `,
+      [startDate, endDate]
+    );
+
+    const dayPermMap = new Map();
+    for (const r of dayPermRows) {
+      const key = `${r.employeeID}_${dayjs(r.d).format("YYYY-MM-DD")}`;
+      dayPermMap.set(key, {
+        day_perm_min_start: r.day_perm_min_start,
+        day_perm_max_end: r.day_perm_max_end,
+      });
+    }
+
+    // ==============================
+    // 0) INCAPACIDADES DEL RANGO
+    // ==============================
+    const [disRows] = await db.query(
+      `
+    SELECT
+      d.employeeID,
+      DATE(d.startDate) AS startD,
+      DATE(d.endDate)   AS endD,
+      d.startTime
+    FROM disability_emp d
+    INNER JOIN employees_emp e ON e.employeeID = d.employeeID
+    WHERE DATE(d.startDate) <= ?
+      AND DATE(d.endDate) >= ?
+     
+    `,
+      [endDate, startDate]
+    );
+
+    const disabilityMap = new Map();
+
+    const pushDisInterval = (employeeID, dateStr, sMin, eMin) => {
+      if (sMin == null || eMin == null) return;
+      if (eMin <= sMin) return;
+
+      const key = `${employeeID}_${dateStr}`;
+      if (!disabilityMap.has(key)) disabilityMap.set(key, []);
+      disabilityMap.get(key).push([sMin, eMin]);
+    };
+
+    for (const r of disRows) {
+      const emp = r.employeeID;
+      const startD = dayjs(r.startD);
+      const endD = dayjs(r.endD);
+
+      const sMin = timeToMinutes(r.startTime); // hora inicio
+      const totalDays = endD.diff(startD, "day");
+
+      for (let i = 0; i <= totalDays; i++) {
+        const cur = startD.add(i, "day");
+        const dateStr = cur.format("YYYY-MM-DD");
+
+        if (i === 0) {
+          // primer día: desde startTime hasta fin del día
+          pushDisInterval(emp, dateStr, sMin, 24 * 60);
+        } else {
+          // resto de días (incluye último): todo el día
+          pushDisInterval(emp, dateStr, 0, 24 * 60);
+        }
+      }
+    }
+
+    // ======================================================
+    // 2) Datos base: permisos + detalles + turno del día (ds)
+    // ======================================================
+    const [rows] = await db.query(
+      `
+      SELECT
+        e.employeeID,
+        e.codeEmployee,
+        CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) AS fullName,
+        payType.payrollName AS Planilla,
+        COALESCE(hs.shiftID, e.shiftID) AS shiftID,
+        p.date,
+        p.permissionID,
+
+        -- turno del día
+        ds.day,
+        ds.startTime,
+        ds.endTime,
+
+        -- cabecera del permiso
+        p.exitPermission,
+        p.entryPermission,
+
+        -- horas de permiso original (cabecera)
+        IF(p.exitPermission IS NOT NULL,
+           TIMESTAMPDIFF(MINUTE, p.exitPermission, p.entryPermission) / 60.0,
+           0) AS permisoHoursOriginal,
+
+        CONCAT(p.exitPermission, ' - ', p.entryPermission) AS permisoRangeHours,
+
+        -- comentario (detalle > cabecera)
+        p.comment  AS permisoComment,
+        dp.comment AS detalleComment,
+
+        -- etiqueta de pago
+        CASE 
+          WHEN dp.withPay IS NOT NULL THEN 
+            CASE dp.withPay WHEN 1 THEN 'Con goce' ELSE 'Sin goce' END
+          ELSE 
+            CASE p.isPaid  WHEN 1 THEN 'Con goce' ELSE 'Sin goce' END
+        END AS Pago,
+
+        -- bandera de almuerzo a nivel permiso (0/1)
+        CASE 
+          WHEN dp.lunchTime IS NOT NULL THEN dp.lunchTime
+          ELSE p.lunchTime
+        END AS lunchTime,
+
+        -- marcajes
+        h.entryTime,
+        h.exitTime,
+
+        -- Excepción vigente en la fecha del permiso; FK del empleado solo sin historial
+        COALESCE(
+          (
+            SELECT exHistory.exceptionTime
+            FROM h_assigmentexception_emp hx
+            INNER JOIN exceptions_emp exHistory ON exHistory.exceptionID = hx.exceptionID
+            WHERE hx.employeeID = e.employeeID
+              AND hx.startDate <=DATE(p.date)
+              AND (hx.endDate IS NULL OR hx.endDate >= DATE(p.date))
+            ORDER BY hx.startDate DESC, hx.hassignmentexceptionID DESC
+            LIMIT 1
+          ),
+          CASE
+            WHEN EXISTS (
+              SELECT 1 FROM h_assigmentexception_emp hx
+              WHERE hx.employeeID = e.employeeID
+            ) THEN 0
+            ELSE COALESCE(exc.exceptionTime, 0)
+          END
+        ) AS exceptionTime,
+
+        -- campos de detalle (para dpAgg en JS)
+        dp.permitStartTime    AS dp_permitStartTime,
+        dp.permitEndTime      AS dp_permitEndTime,
+        dp.lunchTime          AS dp_lunchTime,
+        dp.ausence_permissions AS dp_ausence_permissions,
+        dp.withPay            AS dp_withPay
+      FROM permissionattendance_emp p
+      LEFT JOIN detailpermission_emp dp ON dp.permissionID = p.permissionID
+      INNER JOIN employees_emp e         ON e.employeeID = p.employeeID
+      LEFT JOIN h_attendance_emp h
+        ON h.employeeID = e.employeeID
+       AND DATE(h.date) = DATE(p.date)
+      INNER JOIN payrolltype_emp payType ON payType.payrollTypeID = e.payrollTypeID
+      LEFT JOIN exceptions_emp exc       ON exc.exceptionID = e.exceptionID
+      LEFT JOIN h_assigmentshift_emp hs
+        ON hs.employeeID = e.employeeID
+       AND DATE(hs.startDate) <= DATE(p.date)
+       AND (hs.endDate IS NULL OR DATE(hs.endDate) >= DATE(p.date))
+      LEFT JOIN detailsshift_emp ds
+        ON ds.shiftID = COALESCE(hs.shiftID, e.shiftID)
+       AND ds.day     = DAYNAME(p.date)
+      WHERE p.date BETWEEN ? AND ?
+        AND p.isApproved = 1
+       
+      ORDER BY p.date ASC, e.codeEmployee ASC, p.permissionID ASC;
+      `,
+      [startDate, endDate]
+    );
+
+    // =================================================
+    // 3) Agrupar por permisoID -> permissionRecords
+    // =================================================
+    const permissionsMap = new Map();
+
+    for (const row of rows) {
+      if (!row.permissionID) continue;
+
+      let perm = permissionsMap.get(row.permissionID);
+      if (!perm) {
+        const dateStr = dayjs(row.date).format("YYYY-MM-DD");
+        const dayKey = `${row.employeeID}_${dateStr}`;
+        const dayPerm = dayPermMap.get(dayKey) || {};
+
+        perm = {
+          permissionID: row.permissionID,
+          employeeID: row.employeeID,
+          codeEmployee: row.codeEmployee,
+          fullName: row.fullName,
+          Planilla: row.Planilla,
+          shiftID: row.shiftID,
+          date: row.date,
+
+          day: row.day,
+          startTime: row.startTime,
+          endTime: row.endTime,
+
+          exitPermission: row.exitPermission,
+          entryPermission: row.entryPermission,
+
+          permisoHoursOriginal: row.permisoHoursOriginal,
+          permisoRangeHours: row.permisoRangeHours,
+
+          headerComment: row.permisoComment,
+          pagoLabel: row.Pago,
+          lunchTime: Number(row.lunchTime || 0),
+
+          entryTime: row.entryTime,
+          exitTime: row.exitTime,
+          exceptionTime: row.exceptionTime,
+
+          day_perm_min_start: dayPerm.day_perm_min_start || null,
+          day_perm_max_end: dayPerm.day_perm_max_end || null,
+
+          details: [],
+        };
+        permissionsMap.set(row.permissionID, perm);
+      }
+
+      if (row.dp_permitStartTime || row.dp_permitEndTime) {
+        perm.details.push({
+          permitStartTime: row.dp_permitStartTime,
+          permitEndTime: row.dp_permitEndTime,
+          lunchTime: row.dp_lunchTime,
+          ausence_permissions: row.dp_ausence_permissions,
+          withPay: row.dp_withPay,
+          comment: row.detalleComment,
+        });
+      }
+    }
+
+    const permissionRecords = Array.from(permissionsMap.values());
+
+    // =================================================
+    // 4) AGRUPAR por EMPLEADO + FECHA (día completo)
+    // =================================================
+    const dayGroupsMap = new Map();
+
+    for (const perm of permissionRecords) {
+      const dateStr = dayjs(perm.date).format("YYYY-MM-DD");
+      const key = `${perm.employeeID}_${dateStr}`;
+
+      let g = dayGroupsMap.get(key);
+      if (!g) {
+        g = {
+          employeeID: perm.employeeID,
+          codeEmployee: perm.codeEmployee,
+          fullName: perm.fullName,
+          Planilla: perm.Planilla,
+          date: perm.date,
+          day: perm.day,
+          startTime: perm.startTime,
+          endTime: perm.endTime,
+          entryTime: perm.entryTime,
+          exitTime: perm.exitTime,
+          exceptionTime: perm.exceptionTime,
+          permissions: [],
+          permissionIDs: [],
+        };
+        dayGroupsMap.set(key, g);
+      }
+
+      g.permissions.push(perm);
+      if (perm.permissionID != null) {
+        g.permissionIDs.push(perm.permissionID);
+      }
+    }
+
+    // =================================================
+    // 5) Cálculo de horas a nivel DÍA
+    // =================================================
+    const computeDayHoras = (group) => {
+      const {
+        startTime,
+        endTime,
+        entryTime,
+        exitTime,
+        exceptionTime,
+        permissions,
+      } = group;
+
+      const dateStr = dayjs(group.date).format("YYYY-MM-DD");
+      const disKey = `${group.employeeID}_${dateStr}`;
+      let disabilityIntervals = disabilityMap.get(disKey) || [];
+      group._hasBlockedByDisability = false;
+
+      const isNightShift = isNightShiftByTimes(startTime, endTime);
+      const EFFECTIVE_LUNCH_HOURS = isNightShift ? 0 : LUNCH_HOURS;
+
+      // HrsLaborables de la jornada (restando almuerzo fijo de turno)
+      let HrsLaborables = 0;
+      if (startTime && endTime) {
+        HrsLaborables = diffHours(startTime, endTime) - EFFECTIVE_LUNCH_HOURS;
+        if (HrsLaborables < 0) HrsLaborables = 0;
+      }
+
+      const startMin = timeToMinutes(startTime);
+      const endMin = timeToMinutes(endTime);
+      const entryMin = timeToMinutes(entryTime);
+      const exitMin = timeToMinutes(exitTime);
+
+      let startM = startMin;
+      let endM = endMin;
+      let entryM = entryMin;
+      let exitM = exitMin;
+
+      if (isNightShift) {
+        // el fin del turno pasa al "día siguiente"
+        if (endM != null) endM += 1440;
+
+        // si entrada/salida están después de medianoche, súmalas para caer en el mismo día lógico
+        if (entryM != null && startM != null && entryM < startM) entryM += 1440;
+        if (exitM != null && startM != null && exitM < startM) exitM += 1440;
+      }
+
+      if (isNightShift && startM != null && disabilityIntervals.length) {
+        disabilityIntervals = disabilityIntervals.map(([s, e]) => {
+          let ns = s;
+          let ne = e;
+          if (ns < startM) ns += 1440;
+          if (ne < startM) ne += 1440;
+          if (ne <= ns) ne += 1440;
+          return [ns, ne];
+        });
+        // opcional pero recomendado para que subtractIntervals funcione “limpio”
+        disabilityIntervals = mergeIntervals(disabilityIntervals);
+      }
+
+      const applyDisabilityBlock = (s, e) => {
+        if (!disabilityIntervals.length) return [[s, e]];
+        return subtractIntervals(disabilityIntervals, s, e);
+      };
+
+      // ✅ NUEVO: horas de incapacidad dentro del turno (para NO sumarlas como trabajadas)
+      let disCoveredMin = 0;
+      if (startM != null && endM != null && disabilityIntervals.length) {
+        disCoveredMin = coverageInSegment(disabilityIntervals, startM, endM);
+      }
+      const disHours = disCoveredMin / 60.0;
+
+      // ✅ Horas laborables efectivas (turno - almuerzo - incapacidad)
+      const HrsLaborablesEff = Math.max(HrsLaborables - disHours, 0);
+
+      // Intervalos en minutos
+      const permisoIntervals = [];
+      const ausenciaIntervals = [];
+
+      let permisoLunchFlag = false;
+      let ausenciaLunchFlag = false;
+      let anyLunchFlag = false;
+
+      let permisoHoursOriginalSum = 0;
+
+      let headerComment = "-";
+      let pagoLabel = "Sin goce";
+
+      // RECORRER TODOS LOS PERMISOS DEL DÍA
+      for (const perm of permissions) {
+        permisoHoursOriginalSum += perm.permisoHoursOriginal || 0;
+
+        if (perm.headerComment && perm.headerComment.trim() && headerComment === "-") {
+          headerComment = perm.headerComment;
+        }
+
+        if (perm.pagoLabel) {
+          pagoLabel = perm.pagoLabel;
+        }
+
+        const hasDetails = perm.details && perm.details.length > 0;
+
+        if (hasDetails) {
+          for (const d of perm.details) {
+            let s = timeToMinutes(d.permitStartTime);
+            let e = timeToMinutes(d.permitEndTime);
+
+            if (isNightShift && s != null && e != null && startM != null) {
+              if (s < startM) s += 1440;
+              if (e < startM) e += 1440;
+              if (e <= s) e += 1440;
+            }
+            if (s == null || e == null || e <= s) continue;
+
+            const isAus = Number(d.ausence_permissions || 0) === 1;
+            const hasLunch = Number(d.lunchTime || 0) === 1;
+
+
+
+            if (isAus) {
+              const remainingAus = applyDisabilityBlock(s, e);
+              for (const [rs, re] of remainingAus) {
+                ausenciaIntervals.push([rs, re]);
+              }
+              if (hasLunch) {
+                ausenciaLunchFlag = true;
+                anyLunchFlag = true;
+              }
+            } else {
+              // permisoIntervals.push([s, e]);
+              const remainingParts = applyDisabilityBlock(s, e);
+              d._blockedByDisability = remainingParts.length === 0;
+
+              if (d._blockedByDisability) {
+                group._hasBlockedByDisability = true;
+              } else {
+                for (const [rs, re] of remainingParts) {
+                  permisoIntervals.push([rs, re]);
+                }
+              }
+
+              if (hasLunch) {
+                permisoLunchFlag = true;
+                anyLunchFlag = true;
+              }
+            }
+
+
+          }
+
+          // ====== NUEVO: AUSENCIA AUTOMÁTICA por reducción del permiso (cabecera vs detalles) ======
+          if (perm.exitPermission && perm.entryPermission) {
+            let origS = timeToMinutes(perm.exitPermission);
+            let origE = timeToMinutes(perm.entryPermission);
+
+            if (origS != null && origE != null) {
+              if (isNightShift && startM != null) {
+                if (origS < startM) origS += 1440;
+                if (origE < startM) origE += 1440;
+                if (origE <= origS) origE += 1440; // por si cruza medianoche
+              }
+
+
+              if (origE > origS) {
+
+
+                const allDetailIntervals = [];
+
+                for (const d of perm.details) {
+                  let ds = timeToMinutes(d.permitStartTime);
+                  let de = timeToMinutes(d.permitEndTime);
+                  if (ds == null || de == null) continue;
+
+                  if (isNightShift && ds != null && de != null && startM != null) {
+                    if (ds < startM) ds += 1440;
+                    if (de < startM) de += 1440;
+                    if (de <= ds) de += 1440;
+                  }
+
+                  if (de > ds) allDetailIntervals.push([ds, de]);
+                }
+
+                // ✅ y SOLO si hay detalles, calculás gaps
+                if (allDetailIntervals.length > 0) {
+
+                  const shiftS = startM;
+                  const shiftE = endM;
+
+                  const clippedOrigS = (shiftS != null) ? Math.max(origS, shiftS) : origS;
+                  const clippedOrigE = (shiftE != null) ? Math.min(origE, shiftE) : origE;
+
+                  if (clippedOrigE > clippedOrigS) {
+                    const gaps = subtractIntervals(allDetailIntervals, clippedOrigS, clippedOrigE);
+
+                    for (const [gs, ge] of gaps) {
+                      const remainingGap = applyDisabilityBlock(gs, ge);
+                      for (const [rs, re] of remainingGap) {
+                        if (re > rs) ausenciaIntervals.push([rs, re]);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+        } else {
+
+
+          if (perm.exitPermission && perm.entryPermission) {
+            let s = timeToMinutes(perm.exitPermission);
+            let e = timeToMinutes(perm.entryPermission);
+
+            if (isNightShift && startM != null && s != null && e != null) {
+              if (s < startM) s += 1440;
+              if (e < startM) e += 1440;
+              if (e <= s) e += 1440;
+            }
+
+            if (s != null && e != null && e > s) {
+              // permisoIntervals.push([s, e]);
+              const remainingParts = applyDisabilityBlock(s, e);
+
+              perm._blockedByDisability = remainingParts.length === 0;
+
+              if (remainingParts.length === 0) {
+                group._hasBlockedByDisability = true;
+              } else {
+                for (const [rs, re] of remainingParts) {
+                  permisoIntervals.push([rs, re]);
+                }
+              }
+              if (Number(perm.lunchTime || 0) === 1) {
+                permisoLunchFlag = true;
+                anyLunchFlag = true;
+              }
+            }
+          }
+        }
+
+        if (!hasDetails && Number(perm.lunchTime || 0) === 1) {
+          permisoLunchFlag = true;
+          anyLunchFlag = true;
+        }
+      }
+
+      // H.P
+      const totalPermMin = totalMinutes(permisoIntervals);
+      const hrsPermiso_base = totalPermMin / 60.0;
+
+      let descuentoAlmuerzoPermiso = 0;
+      if (permisoLunchFlag) descuentoAlmuerzoPermiso = EFFECTIVE_LUNCH_HOURS;
+
+      let hrsPermiso = Math.max(hrsPermiso_base - descuentoAlmuerzoPermiso, 0);
+
+      // H.A detalle
+      const totalAusMin = totalMinutes(ausenciaIntervals);
+      const hrsAusente_detalle_base = totalAusMin / 60.0;
+
+      let descuentoAlmuerzoAusente = 0;
+      if (ausenciaLunchFlag) descuentoAlmuerzoAusente = EFFECTIVE_LUNCH_HOURS;
+
+      let hrsAusente_detalle = Math.max(
+        hrsAusente_detalle_base - descuentoAlmuerzoAusente,
+        0
+      );
+
+      // Casos 1,2,3
+      const soloEntradaSinSalida = !!entryTime && !exitTime;
+      const soloSalidaSinEntrada = !entryTime && !!exitTime;
+      const caso3 = soloEntradaSinSalida || soloSalidaSinEntrada;
+
+      let hrsAusente_entrada = 0;
+      let hrsAusente_salida = 0;
+      let hrsAusencia = 0;
+      let hrsTrabajadas = 0;
+
+      if (caso3) {
+        hrsPermiso = 0;
+        hrsAusencia = 0;
+        hrsTrabajadas = 0;
+      } else {
+        const noEntry = !entryTime;
+        const noExit = !exitTime;
+
+        if (noEntry && noExit && totalAusMin === 0) {
+          // CASO 1
+          const netPermiso = hrsPermiso;
+          hrsAusencia = Math.max(HrsLaborablesEff - netPermiso, 0);
+        } else {
+          // CASO 2
+
+          // REGLA 1: entrada tarde
+          if (entryM != null && startM != null && entryM > startM) {
+            const segEnd = (endM != null) ? Math.min(entryM, endM) : entryM;
+
+            const coveredMin = coverageInSegment(
+              [...permisoIntervals, ...ausenciaIntervals, ...disabilityIntervals],
+              startM,
+              segEnd
+            );
+
+            let baseMin = (segEnd - startM) - coveredMin;
+            if (baseMin < 0) baseMin = 0;
+//por aqui me quede
+            baseMin = Math.max(baseMin - Number(exceptionTime || 0), 0);
+
+            const lunchThresholdMin = 12 * 60 + 45;
+            if (!isNightShift && baseMin > 0 && entryM >= lunchThresholdMin && !anyLunchFlag) {
+              baseMin -= EFFECTIVE_LUNCH_HOURS * 60;
+              if (baseMin < 0) baseMin = 0;
+            }
+
+            hrsAusente_entrada = baseMin / 60.0;
+          }
+
+          // REGLA 2: salida temprano (sin permisos)
+          if (exitM != null && endM != null && exitM < endM) {
+            const coveredAfterExit = coverageInSegment(
+              [...permisoIntervals, ...ausenciaIntervals, ...disabilityIntervals],
+              exitM,
+              endM
+            );
+
+            let effectiveGapMin = (endM - exitM) - coveredAfterExit;
+            if (effectiveGapMin < 0) effectiveGapMin = 0;
+
+            let baseHours = effectiveGapMin / 60.0 - Number(exceptionTime || 0);
+            if (baseHours < 0) baseHours = 0;
+
+            hrsAusente_salida = baseHours;
+          }
+
+          hrsAusencia =
+            hrsAusente_detalle + hrsAusente_entrada + hrsAusente_salida;
+        }
+
+        hrsTrabajadas = Math.max(
+          HrsLaborablesEff - (hrsPermiso + hrsAusencia),
+          0
+        );
+      }
+
+      const sumaHoras = hrsPermiso + hrsAusencia + hrsTrabajadas;
+      const diferenciaHoras = HrsLaborablesEff - sumaHoras;
+
+      return {
+        day: group.day,
+        HrsLaborables,
+        hrsPermiso,
+        hrsAusencia,
+        hrsTrabajadas,
+        sumaHoras,
+        diferenciaHoras,
+        permisoHoursOriginal: permisoHoursOriginalSum,
+        commentText: headerComment,
+        Pago: pagoLabel,
+      };
+    };
+
+    const empWeekAbsenceHours = new Map();
+    const groupHorasMap = new Map();
+
+    for (const [key, group] of dayGroupsMap.entries()) {
+      const horas = computeDayHoras(group);
+      groupHorasMap.set(key, horas);
+
+      const dateObj = dayjs(group.date);
+      // Clave única por empleado y su semana ISO correspondiente (ej: "123_2026_15")
+      const weekKey = `${group.employeeID}_${dateObj.isoWeekYear()}_${dateObj.isoWeek()}`;
+
+      const current = empWeekAbsenceHours.get(weekKey) || 0;
+      empWeekAbsenceHours.set(weekKey, current + (horas.hrsAusencia || 0));
+    }
+
+    // =================================================
+    // 6) Construir estructura final (filas por PERMISO / DETALLE)
+    // =================================================
+    const excelRows = [];
+    const mergeGroups = []; // para mergear columnas de identificación por día
+
+    for (const [key, group] of dayGroupsMap.entries()) {
+      const horas = groupHorasMap.get(key);
+
+      const dateObj = dayjs(group.date);
+      const weekKey = `${group.employeeID}_${dateObj.isoWeekYear()}_${dateObj.isoWeek()}`;
+
+      const totalWeekAbsenceHours = empWeekAbsenceHours.get(weekKey) || 0;
+      const isSemanal = group.Planilla && String(group.Planilla).trim().toLowerCase() === "semanal";
+      const shouldHighlightRed = totalWeekAbsenceHours > (5 / 60) && isSemanal;
+
+
+      const baseDayInfo = {
+        codeEmployee: group.codeEmployee,
+        fullName: group.fullName,
+        Planilla: group.Planilla,
+        date: group.date,
+        entryTime: group.entryTime,
+        exitTime: group.exitTime,
+        HrsLaborables: horas.HrsLaborables,
+        // hrsPermiso: horas.hrsPermiso,
+        hrsAusencia: horas.hrsAusencia,
+        hrsTrabajadas: horas.hrsTrabajadas,
+        // Pago: horas.Pago,
+        blockedByDisability: group._hasBlockedByDisability,
+        shouldHighlightRed,
+      };
+
+      const rowsForGroup = [];
+
+      for (const perm of group.permissions) {
+        const permId = perm.permissionID;
+        const headerComment = perm.headerComment;
+
+        if (perm.details && perm.details.length > 0) {
+          let hasPermDetail = false;
+
+          for (const d of perm.details) {
+            const isAus = Number(d.ausence_permissions || 0) === 1;
+            const hasLunch = Number(d.lunchTime || 0) === 1;
+            const isNightShiftGroup = isNightShiftByTimes(group.startTime, group.endTime);
+            const lunchHoursRow = isNightShiftGroup ? 0 : LUNCH_HOURS;
+
+            const hPerm = isAus ? 0 : hoursRange(d.permitStartTime, d.permitEndTime, hasLunch, lunchHoursRow);
+
+            const blockedRow = !isAus && !!d._blockedByDisability;
+
+            const sStr = getTimeString(d.permitStartTime);
+            const eStr = getTimeString(d.permitEndTime);
+            const baseRange =
+              sStr && eStr ? `${sStr} - ${eStr}` : "-";
+            const tipoDetalle = isAus ? "D.A" : "D.P";
+            const rango =
+              baseRange !== "-" ? `${baseRange} (${tipoDetalle})` : "-";
+
+            // Comentario SOLO texto (detalle > cabecera)
+            const commentText =
+              (d.comment && String(d.comment).trim()) || "-";
+
+            // const remainingParts = applyDisabilityBlock(s, e);
+
+            // let blockedRow = false;
+            // if (remainingParts.length === 0) {
+            //   blockedRow = true;
+            //   // permisoIntervals no recibe nada
+            // } else {
+            //   for (const [rs, re] of remainingParts) permisoIntervals.push([rs, re]);
+            // }
+
+            rowsForGroup.push({
+              ...baseDayInfo,
+              blockedByDisabilityRow: blockedRow,
+              permissionID: permId,
+              rangoPermiso: rango,
+              isAusDetail: isAus,
+              hrsPermiso: blockedRow ? 0 : Number(hPerm.toFixed(2)),
+              Pago: d.withPay != null ? payLabel(d.withPay) : (perm.pagoLabel || "Sin goce"),
+              commentText,
+              shouldHighlightRed,
+            });
+
+            if (!isAus) hasPermDetail = true;
+          }
+
+          // Si solo hubo detalles de AUSENCIA, mostramos también el rango original
+          if (!hasPermDetail && perm.exitPermission && perm.entryPermission) {
+            const sStr = getTimeString(perm.exitPermission);
+            const eStr = getTimeString(perm.entryPermission);
+            const rango =
+              sStr && eStr ? `${sStr} - ${eStr}` : "-";
+
+            const commentText =
+              (headerComment && String(headerComment).trim()) || "-";
+
+            rowsForGroup.push({
+              ...baseDayInfo,
+              permissionID: permId,
+              rangoPermiso: rango,
+              isAusDetail: false,
+              hrsPermiso: 0,
+              Pago: perm.pagoLabel || "Sin goce",
+              commentText,
+              shouldHighlightRed,
+            });
+          }
+        } else {
+          // Solo permiso original (sin detalles)
+          const sStr = getTimeString(perm.exitPermission);
+          const eStr = getTimeString(perm.entryPermission);
+          const rango =
+            sStr && eStr ? `${sStr} - ${eStr}` : "-";
+
+          const isNightShiftGroup = isNightShiftByTimes(group.startTime, group.endTime);
+          const lunchHoursRow = isNightShiftGroup ? 0 : LUNCH_HOURS;
+          const hasLunch = Number(perm.lunchTime || 0) === 1;
+          const hPerm = hoursRange(perm.exitPermission, perm.entryPermission, hasLunch, lunchHoursRow);
+          const commentText =
+            (headerComment && String(headerComment).trim()) || "-";
+
+          const blockedRow = !!perm._blockedByDisability;
+
+          rowsForGroup.push({
+            ...baseDayInfo,
+            blockedByDisabilityRow: blockedRow,
+            permissionID: permId,
+            rangoPermiso: rango,
+            isAusDetail: false,
+            hrsPermiso: blockedRow ? 0 : Number(hPerm.toFixed(2)),
+            Pago: perm.pagoLabel || "Sin goce",
+            commentText,
+            shouldHighlightRed,
+          });
+        }
+      }
+
+      if (rowsForGroup.length === 0) {
+        rowsForGroup.push({
+          ...baseDayInfo,
+          permissionID:
+            group.permissionIDs.length === 1
+              ? group.permissionIDs[0]
+              : group.permissionIDs.join(", "),
+          rangoPermiso: "-",
+          isAusDetail: false,
+          hrsPermiso: 0,
+          Pago: "-",
+          commentText: "-",
+          shouldHighlightRed,
+        });
+      }
+
+      const startIndex = excelRows.length;
+      excelRows.push(...rowsForGroup);
+      const endIndex = excelRows.length - 1;
+      mergeGroups.push({ startIndex, endIndex });
+    }
+
+    // =================================================
+    // 7) Construir Excel (sin Día / Hrs Laborables)
+    // =================================================
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet("Permisos");
+
+    ws.columns = [
+      // { header: "item", key: "item", width: 8 },
+      // { header: "#Permiso", key: "permissionID", width: 16 },
+      { header: "Código", key: "codeEmployee", width: 10 },
+      { header: "Empleado", key: "fullName", width: 30 },
+      { header: "Planilla", key: "Planilla", width: 14 },
+
+      { header: "Fecha", key: "date", width: 12 },
+
+      { header: "T.Permiso (Rangos)", key: "rangoPermiso", width: 26 },
+
+      { header: "Horas Permiso", key: "hrsPermiso", width: 18 },
+      { header: "Horas Ausentes", key: "hrsAusencia", width: 18 },
+      { header: "Horas Trabajadas", key: "hrsTrabajadas", width: 18 },
+
+      { header: "Pago", key: "Pago", width: 12 },
+      { header: "Comentario", key: "commentText", width: 40 },
+    ];
+
+    // Título
+    ws.spliceRows(1, 0, []);
+    const titleCell = ws.getCell(1, 1);
+    titleCell.value = "PERMISOS";
+    ws.mergeCells(1, 1, 1, ws.columns.length);
+    titleCell.font = { bold: true, size: 14 };
+    titleCell.alignment = { vertical: "middle", horizontal: "center" };
+
+    const headerRow = ws.getRow(2);
+    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    headerRow.alignment = { vertical: "middle", horizontal: "center" };
+    headerRow.height = 20;
+    for (let c = 1; c <= ws.columns.length; c++) {
+      const cell = headerRow.getCell(c);
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF1F2937" },
+      };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+
+    const thin = {
+      top: { style: "thin" },
+      left: { style: "thin" },
+      bottom: { style: "thin" },
+      right: { style: "thin" },
+    };
+
+    const colCodeEmployee =
+      ws.columns.findIndex((c) => c.key === "codeEmployee") + 1;
+    const colFullName =
+      ws.columns.findIndex((c) => c.key === "fullName") + 1;
+    const colPlanilla =
+      ws.columns.findIndex((c) => c.key === "Planilla") + 1;
+    const colFecha =
+      ws.columns.findIndex((c) => c.key === "date") + 1;
+
+    const rangoColIndex =
+      ws.columns.findIndex((c) => c.key === "rangoPermiso") + 1;
+    const comentarioColIndex =
+      ws.columns.findIndex((c) => c.key === "commentText") + 1;
+
+    let idx = 0;
+    for (const g of excelRows) {
+      idx += 1;
+
+      const hpNum =
+        g.hrsPermiso != null ? parseFloat(g.hrsPermiso) : (parseFloat(g.hrsPermiso) || 0);
+      const haNum = parseFloat(g.hrsAusencia) || 0;
+      const hrsTrabajadas = parseFloat(g.hrsTrabajadas) || 0;
+
+      const row = ws.addRow({
+        // item: idx,
+        // permissionID: g.permissionID,
+        codeEmployee: Number(g.codeEmployee ?? "-"),
+        fullName: g.fullName ?? "-",
+        Planilla: g.Planilla ?? "-",
+
+        date: formatDate(g.date),
+
+        rangoPermiso: g.rangoPermiso || "-",
+
+        hrsPermiso: Number(hpNum.toFixed(2)),
+        hrsAusencia: Number(haNum.toFixed(2)),
+        hrsTrabajadas: Number(hrsTrabajadas.toFixed(2)),
+
+        Pago: g.Pago,
+        commentText: g.commentText || "-",
+      });
+
+      const colRango = ws.columns.findIndex((c) => c.key === "rangoPermiso") + 1;
+      const colHP = ws.columns.findIndex((c) => c.key === "hrsPermiso") + 1;
+
+      // Regla semanal acumulada.
+      const shouldHighlightRed = !!g.shouldHighlightRed;
+      // const shouldHighlightYellow = !shouldHighlightRed && g.blockedByDisability;
+      const shouldYellow = !shouldHighlightRed && g.blockedByDisabilityRow;
+
+      for (let c = 1; c <= ws.columns.length; c++) {
+        const cell = row.getCell(c);
+        cell.border = thin;
+        cell.alignment = {
+          vertical: "middle",
+          horizontal: "center",
+          wrapText: c === rangoColIndex || c === comentarioColIndex,
+        };
+
+
+        if (shouldHighlightRed) {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFF9999" } };
+        } else if (shouldYellow && (c === colRango || c === colHP)) {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF99" } };
+        }
+      }
+    }
+
+    const colHP = ws.columns.findIndex((c) => c.key === "hrsPermiso") + 1;
+    const colHA = ws.columns.findIndex((c) => c.key === "hrsAusencia") + 1;
+    const colHT = ws.columns.findIndex((c) => c.key === "hrsTrabajadas") + 1;
+
+    for (const mg of mergeGroups) {
+      if (mg.endIndex <= mg.startIndex) continue; // solo si hay 2+ filas en ese día
+
+      const startRow = 3 + mg.startIndex;     // primera fila de datos es la 3
+      const endRow = 3 + mg.endIndex;       // última fila del día
+
+      for (const col of [/*colHP,*/ colHA, colHT]) {
+        ws.mergeCells(startRow, col, endRow, col);
+      }
+    }
+
+    // Merge SOLO de columnas de identificación (empleado/día)
+    for (const mg of mergeGroups) {
+      if (mg.endIndex <= mg.startIndex) continue;
+
+      const startRow = 3 + mg.startIndex;
+      const endRow = 3 + mg.endIndex;
+
+      const colsToMerge = [
+        colCodeEmployee,
+        colFullName,
+        colPlanilla,
+        colFecha,
+      ];
+
+      for (const col of colsToMerge) {
+        ws.mergeCells(startRow, col, endRow, col);
+      }
+    }
+
+    const fileTag = nummWeek
+      ? `week${nummWeek}`
+      : `${startDate}_to_${endDate}`;
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=permisos_${fileTag}.xlsx`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error en exportPermissionReportExcel:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error al exportar Excel de permisos",
+      error: error.message,
+    });
+  }
+};
+
+
+exports.EditPermission = async (req, res) => {
+  try {
+    const { permissionID, field, newTime, newValue } = req.body;
+
+    if (!permissionID || !field) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Datos incompletos." });
+    }
+
+    const allowedFields = [
+      "exitPermission",
+      "entryPermission",
+      "isPaid",
+      "comment",
+      "lunchTime",
+      "date", // YYYY-MM-DD
+      "permissionTypeID",
+      "request",
+    ];
+    if (!allowedFields.includes(field)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Campo no permitido." });
+    }
+
+    // 🔹 Caso especial: isPaid (no validar horas)
+    if (field === "isPaid") {
+      const v = Number(newValue) ? 1 : 0;
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET isPaid=?, updatedDate=NOW(), updatedBy=? WHERE permissionID=?",
+        [v, getUserIdFromToken(req) || null, permissionID]
+      );
+
+      // Notificar (opcional) - si quieres también para isPaid
+      if (typeof io !== "undefined") {
+        io.emit("permission:updatedHeader", {
+          permissionID,
+          field: "isPaid",
+          isPaid: v,
+        });
+      }
+
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Actualizado: Pagado.",
+      });
+    }
+
+    if (field === "date") {
+      const s = String(newValue || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Fecha inválida. Usa YYYY-MM-DD." });
+      }
+
+      // Obtener datos actuales para emitir oldDate/employeeID
+      const [[permRow]] = await db.query(
+        "SELECT employeeID, date AS oldDate FROM permissionattendance_emp WHERE permissionID=?",
+        [permissionID]
+      );
+
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET date=?, updatedDate=NOW(), updatedBy=? WHERE permissionID=?",
+        [s, getUserIdFromToken(req) || null, permissionID]
+      );
+
+      // Socket: notificar cambio de fecha (para refresco/auto-navegación)
+      if (typeof io !== "undefined") {
+        io.emit("permission:updatedHeader", {
+          permissionID,
+          field: "date",
+          oldDate: permRow.oldDate,
+          newDate: s,
+          employeeID: permRow.employeeID,
+        });
+        io.emit("permission:updated");
+      }
+
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Fecha actualizada.",
+      });
+    }
+
+    if (field === "permissionTypeID") {
+      const val = Number(newValue);
+      if (!val) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Tipo de permiso inválido." });
+      }
+
+      const [[ptRow]] = await db.query(
+        "SELECT permissionTypeID, permissionTypeName FROM permissiontype_emp WHERE permissionTypeID=?",
+        [val]
+      );
+      if (!ptRow) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Tipo de permiso no encontrado." });
+      }
+
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET permissionTypeID=?, updatedDate=NOW(), updatedBy=? WHERE permissionID=?",
+        [ptRow.permissionTypeID, getUserIdFromToken(req) || null, permissionID]
+      );
+
+      // Socket: notificar cambio de tipo
+      if (typeof io !== "undefined") {
+        io.emit("permission:updatedHeader", {
+          permissionID,
+          field: "permissionTypeID",
+          permissionTypeID: ptRow.permissionTypeID,
+          permissionTypeName: ptRow.permissionTypeName,
+        });
+        io.emit("permission:updated");
+      }
+
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Tipo de permiso actualizado.",
+      });
+    }
+
+    // 🔹 Caso especial: lunchTime (no validar horas)
+    if (field === "lunchTime") {
+      const v = Number(newValue) ? 1 : 0;
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET lunchTime=? WHERE permissionID=?",
+        [v, permissionID]
+      );
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Actualizado: Tiempo de almuerzo.",
+      });
+    }
+
+    // 🔹 Caso especial: comment (no validar horas)
+    if (field === "comment") {
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET comment=? WHERE permissionID=?",
+        [newValue, permissionID]
+      );
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Actualizado: Comentario.",
+      });
+    }
+    // 🔹 Caso especial: request (no validar horas
+    if (field === "request") {
+      //const status = newValue === 1 ? 1 : 0;
+      const [r] = await db.query(
+        "UPDATE permissionattendance_emp SET request=?, status=? WHERE permissionID=?",
+        [newValue, newValue, permissionID]
+      );
+      return res.json({
+        success: r.affectedRows > 0,
+        message: "Actualizado",
+      });
+    }
+    if (!newTime) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Falta la hora." });
+    }
+    const normalized = normalizeTimeToSQL(newTime);
+    if (!normalized) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Formato de hora inválido." });
+    }
+
+    // Traer valores actuales para validar orden de horas
+    const [[curr]] = await db.query(
+      "SELECT exitPermission, entryPermission FROM permissionattendance_emp WHERE permissionID=?",
+      [permissionID]
+    );
+    if (!curr) {
+      return res
+        .status(404)
+        .json({ success: false, message: "No existe el permiso." });
+    }
+
+    const exitPerm =
+      field === "exitPermission" ? normalized : curr.exitPermission;
+    const entryPerm =
+      field === "entryPermission" ? normalized : curr.entryPermission;
+
+    // Validación: salida no puede ser mayor que entrada
+    if (exitPerm && entryPerm && exitPerm > entryPerm) {
+      return res.status(400).json({
+        success: false,
+        message: "La salida no puede ser mayor que la entrada.",
+      });
+    }
+
+    const [result] = await db.query(
+      `UPDATE permissionattendance_emp SET ${field}=?, updatedDate=NOW(), updatedBy=? WHERE permissionID=?`,
+      [normalized, getUserIdFromToken(req) || null, permissionID]
+    );
+
+    // Socket: notificar cambio de hora real
+    if (typeof io !== "undefined") {
+      io.emit("permission:updatedTime", {
+        permissionID,
+        field,
+        value: normalized,
+      });
+    }
+
+    return res.json({
+      success: result.affectedRows > 0,
+      message: "Cambio de hora realizado exitosamente.",
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al actualizar el permiso.",
+      error: error.message,
+    });
+  }
+};
+
+function normalizeTimeToSQL(value) {
+  if (!value) return null;
+
+  if (/^\d{2}:\d{2}:\d{2}$/.test(value)) return value;
+
+  const tryFormats = ["hh:mm a", "hh:mm:ss a", "HH:mm", "HH:mm:ss"];
+  for (const f of tryFormats) {
+    const d = dayjs(value, f, true);
+    if (d.isValid()) return d.format("HH:mm:ss");
+  }
+  return null;
+}
+
+// Función para obtener permisos sin aprobación
+exports.getPermissionsWithoutApproval = async (req, res) => {
+  try {
+    const userID = getUserIdFromToken(req);
+
+    const [userData] = await db.query(
+      `
+       SELECT employeeID, email
+       FROM users_us
+       WHERE userID = ?;
+        `,
+      [userID]
+    );
+
+    if (!userData[0]?.employeeID) {
+      return res.status(404).json({
+        success: false,
+        message: "No se encontró el empleado asociado al usuario.",
+      });
+    }
+
+    const [employeeRow] = await db.query(
+      `SELECT managerID FROM employees_emp WHERE employeeID = ?;`,
+      [userData[0].employeeID]
+    );
+
+    const isAssistantApprover = Number(userData?.[0]?.employeeID) === 256;
+    const approvalTargetManagerID = isAssistantApprover && employeeRow[0]?.managerID
+      ? employeeRow[0].managerID
+      : userData[0].employeeID;
+
+    const [permissionResults] = await db.query(
+      `
+        SELECT 
+          pa.permissionID, CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, e.codeEmployee,
+          comment, pa.request, e.photoUrl, e.employeeID, j.jobName, pa.permissionID, p.permissionTypeID, p.permissionTypeName,
+          pa.date, pa.exitTimePermission, pa.entryTimePermission, e.managerID, pa.coveredTime,
+          pa.exitPermission, pa.entryPermission, pa.isApproved, pa.isPaid, pa.status
+        FROM
+        permissionattendance_emp pa
+                INNER JOIN permissiontype_emp p on p.permissionTypeID = pa.permissionTypeID
+                INNER JOIN employees_emp e on e.employeeID = pa.employeeID
+                INNER JOIN jobs_emp j on e.jobID = j.jobID
+        where pa.date between '${dayjs()
+        .subtract(1, "month")
+        .format("YYYY-MM-DD")}' and 
+      '${dayjs().add(1, "month").format("YYYY-MM-DD")}'
+        and !isApproved and e.managerID = ?
+        ORDER BY pa.permissionID desc;
+        `,
+      [approvalTargetManagerID]
+    );
+
+    res.json(permissionResults);
+  } catch (err) {
+    console.error("Error fetching all permissions:", err);
+    res.status(500).json({
+      message: "Error al cargar todos los permisos",
+      error: err.message,
+    });
+  }
+};
+
+// Función para obtener permisos por gerente
+exports.getPermissionsByManager = async (req, res) => {
+  try {
+    const userID = getUserIdFromToken(req);
+    const [userData] = await db.query(
+      `
+       SELECT employeeID, email
+       FROM users_us
+       WHERE userID = ?;
+        `,
+      [userID]
+    );
+
+    if (!userData[0]?.employeeID) {
+      return res.status(404).json({
+        success: false,
+        message: "No se encontró el empleado asociado al usuario.",
+      });
+    }
+
+    const [manager] = await db.query(
+      `
+       SELECT 
+         codeEmployee, managerID
+       FROM employees_emp
+       WHERE employeeID = ?;
+        `,
+      [userData[0].employeeID]
+    );
+
+    const [isManager] = await db.query(
+      `
+       SELECT 
+         codeEmployee, managerID
+       FROM employees_emp
+       WHERE managerID = ?;
+        `,
+      [userData[0].employeeID]
+    );
+
+    const [employeeRow] = await db.query(
+      `SELECT managerID FROM employees_emp WHERE employeeID = ?;`,
+      [userData[0].employeeID]
+    );
+
+    const isAssistantApprover = Number(userData?.[0]?.employeeID) === 256;
+    let managerSearch = isAssistantApprover && employeeRow[0]?.managerID
+      ? employeeRow[0].managerID
+      : isManager.length > 0
+        ? userData[0].employeeID
+        : manager[0].managerID;
+
+    // Obtener permisos por aprobar
+    const [permisosPorAprobar] = await db.query(
+      `
+        SELECT 
+          pa.permissionID, CONCAT(e.codeEmployee, ' - ', e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, 
+          comment, e.codeEmployee,
+          pa.request, e.photoUrl, e.employeeID, j.jobName, pa.permissionID, p.permissionTypeID, p.permissionTypeName,
+          pa.date, pa.exitTimePermission, pa.entryTimePermission, e.managerID, pa.coveredTime,
+          pa.exitPermission, pa.entryPermission, pa.isApproved, pa.isPaid, pa.status, pa.line,
+          TIMESTAMPDIFF(MINUTE,pa.exitTimePermission, pa.entryTimePermission) / 60 timeHours,
+        att.entryTime attendanceEntry
+        FROM
+        permissionattendance_emp pa
+                INNER JOIN permissiontype_emp p on p.permissionTypeID = pa.permissionTypeID
+                INNER JOIN employees_emp e on e.employeeID = pa.employeeID
+                INNER JOIN jobs_emp j on e.jobID = j.jobID
+                left join (
+                SELECT employeeID, date, MIN(entryTime) AS entryTime
+                FROM h_attendance_emp
+                GROUP BY employeeID, date
+              ) att ON pa.date = att.date AND pa.employeeID = att.employeeID
+        where e.managerID = ? and !isApproved and pa.employeeID != ?
+        ORDER BY pa.permissionID desc;
+        `,
+      [managerSearch, userData[0].employeeID]
+    );
+
+    // Obtener permisos aprobados
+    const [permisosAprobados] = await db.query(
+      `
+        SELECT 
+          CONCAT(e.codeEmployee, ' - ', e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, 
+          comment, e.codeEmployee,
+          pa.request, e.photoUrl,
+          e.employeeID, j.jobName, pa.permissionID, p.permissionTypeID, p.permissionTypeName,
+          pa.date, pa.exitTimePermission, pa.entryTimePermission, e.managerID, pa.coveredTime,
+          pa.exitPermission, pa.entryPermission, pa.isApproved, pa.isPaid, pa.status, pa.line,
+          TIMESTAMPDIFF(MINUTE,pa.exitTimePermission, pa.entryTimePermission) / 60 timeHours,
+        att.entryTime attendanceEntry
+        FROM
+        permissionattendance_emp pa
+                INNER JOIN permissiontype_emp p on p.permissionTypeID = pa.permissionTypeID
+                INNER JOIN employees_emp e on e.employeeID = pa.employeeID
+                INNER JOIN jobs_emp j on e.jobID = j.jobID
+                left join (
+                SELECT employeeID, date, MIN(entryTime) AS entryTime
+                FROM h_attendance_emp
+                GROUP BY employeeID, date
+              ) att ON pa.date = att.date AND pa.employeeID = att.employeeID
+        where pa.date between '${dayjs().format("YYYY-MM-DD")}' and 
+      '${dayjs().add(1, "day").format("YYYY-MM-DD")}'
+        and e.managerID = ? and isApproved and pa.employeeID != ?
+        ORDER BY pa.permissionID desc;
+        `,
+      [managerSearch, userData[0].employeeID]
+    );
+
+    res.json({ permisosPorAprobar, permisosAprobados });
+  } catch (err) {
+    console.error("Error fetching all permissions:", err);
+    res.status(500).json({
+      message: "Error al cargar todos los permisos",
+      error: err.message,
+    });
+  }
+};
+
+// Traer empleados activos por turno
+exports.getEmployeeAttendance = async (req, res) => {
+  try {
+    const { employeeID, dayPermission } = req.params;
+    let currentTime = dayjs().format("HH:mm:ss");
+    let currentDate = dayjs().format("YYYY-MM-DD");
+    let dayString = dayjs(dayPermission)
+      .locale("en")
+      .format("dddd");
+
+    const [shiftDetail] = await db.query(
+      `
+        SELECT
+          s.shiftID, ds.day, s.shiftName, ds.startTime, ds.endTime
+        FROM detailsshift_emp ds
+        INNER JOIN shifts_emp s ON ds.shiftID = s.shiftID
+        WHERE s.companyID = 1
+          AND ds.day = '${dayString}'
+          AND (
+          (ds.startTime < ds.endTime AND '${currentTime}' BETWEEN ds.startTime AND ds.endTime)
+          OR
+          (ds.startTime > ds.endTime AND
+          ('${currentTime}' >= ds.startTime OR '${currentTime}' <= ds.endTime))
+        )
+      `
+    );
+
+    const [dataEmployee] = await db.query(
+      `    
+          SELECT 
+              e.codeEmployee, a.entryTime, s.shiftName, d.startTime, d.endTime, d.day
+          FROM employees_emp e
+          INNER JOIN jobs_emp j ON e.jobID = j.jobID
+          LEFT JOIN h_assigmentshift_emp hs ON hs.employeeID = e.employeeID
+            AND DATE(hs.startDate) <= ?
+            AND (hs.endDate IS NULL OR DATE(hs.endDate) >= ?)
+          INNER JOIN shifts_emp s ON s.shiftID = COALESCE(hs.shiftID, e.shiftID)
+          INNER JOIN detailsshift_emp d ON d.shiftID = s.shiftID
+          LEFT JOIN h_attendance_emp a 
+              ON e.employeeID = a.employeeID 
+            AND a.date = ?
+          WHERE e.employeeID = ?
+          AND d.day = ?;
+      `,
+      [dayPermission, dayPermission, employeeID, dayString]
+    );
+
+    res.json(dataEmployee);
+  } catch (err) {
+    console.error("Error fetching active employees by shift:", err);
+    res.status(500).json({
+      message: "Error al cargar empleados activos por turno",
+      error: err.message,
+    });
+  }
+};
+
+// Función para obtener todos los permisos registrados
+exports.markPermissionAsPaid = async (req, res) => {
+  try {
+    const { permissionID } = req.params;
+    const { isPaid } = req.body;
+    const [results] = await db.query(
+      `
+      UPDATE permissionattendance_emp
+      SET isPaid = ?, updatedDate = ?, updatedBy = ?
+      WHERE permissionID = ?
+    `,
+      [isPaid, ...camposAuditoriaUPDATE(req), permissionID]
+    );
+    if (results.affectedRows === 0) {
+      return res.status(500).json({
+        message: "Permiso no encontrado o ya está marcado como pagado.",
+      });
+    }
+
+    io.emit("permission:updated", { permissionID, field: "isPaid" });
+
+    io.emit("actualizar_permisos_tabla");
+
+    res.json(results);
+  } catch (err) {
+    console.error("Error fetching all permissions:", err);
+    res.status(500).json({
+      message: "Error al cargar todos los permisos",
+      error: err.message,
+    });
+  }
+};
+
+// Controlador para crear y registrar un permiso
+exports.createPermission = async (req, res) => {
+  try {
+    let {
+      employeeID,
+      line,
+      permissionTypeID,
+      date,
+      comment,
+      coveredTime,
+      request,
+      exitTimePermission,
+      entryTimePermission,
+      exitPermission,
+      entryPermission,
+      isPaid,
+      isApproved,
+      status,
+    } = req.body;
+
+    let startShift = null;
+
+    const userID = getUserIdFromToken(req);
+
+    const [userData] = await db.query(
+      `
+       SELECT 
+          employeeID, email
+       FROM users_us
+       WHERE userID = ?;
+        `,
+      [userID]
+    );
+
+    // --- NUEVA VALIDACIÓN POR EL PERMISO DE MENÚ ID 9 (APROBAR PERMISOS) ---
+    const [userAuth] = await db.query(
+      `
+      SELECT 
+        u.userID,
+        EXISTS(
+          SELECT 1 
+          FROM usermenu_us um
+          WHERE um.userID = u.userID AND um.menuOptionID = 9
+        ) AS hasApprovePermission 
+      FROM users_us u
+      WHERE u.userID = ?;
+      `,
+      [userID]
+    );
+
+    const canApprovePermissions = Boolean(userAuth?.[0]?.hasApprovePermission);
+    const isAssistantApprover = Number(userData?.[0]?.employeeID) === 256;
+    // ----------------------------------------------------------------------
+
+    // Validación actualizada para incluir los nuevos campos obligatorios
+    if (!employeeID || !permissionTypeID) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Datos incompletos. Se requiere ID de empleado y tipo de permiso.",
+      });
+    }
+
+    // const permissionDate = dayjs(date).format("YYYY-MM-DD");
+    // const normalizedPermissionStart = normalizeTimeToSQL(exitTimePermission);
+    // const normalizedPermissionEnd = normalizeTimeToSQL(entryTimePermission);
+
+    // if (exitTimePermission || entryTimePermission) {
+    //   if (!normalizedPermissionStart || !normalizedPermissionEnd) {
+    //     return res.status(400).json({
+    //       success: false,
+    //       message: "Las horas del permiso no tienen un formato válido.",
+    //     });
+    //   }
+
+    //   const [shiftRows] = await db.query(
+    //     `SELECT
+    //        COALESCE(hs.shiftID, e.shiftID) AS shiftID,
+    //        ds.startTime,
+    //        ds.endTime
+    //      FROM employees_emp e
+    //      LEFT JOIN h_assigmentshift_emp hs
+    //        ON hs.employeeID = e.employeeID
+    //       AND DATE(hs.startDate) <= ?
+    //       AND (hs.endDate IS NULL OR DATE(hs.endDate) >= ?)
+    //      LEFT JOIN detailsshift_emp ds
+    //        ON ds.shiftID = COALESCE(hs.shiftID, e.shiftID)
+    //       AND ds.day = DAYNAME(?)
+    //      WHERE e.employeeID = ?
+    //      ORDER BY hs.startDate DESC, hs.hassigmentshiftID DESC
+    //      LIMIT 1`,
+    //     [permissionDate, permissionDate, permissionDate, employeeID]
+    //   );
+
+    //   const shift = shiftRows[0];
+    //   if (!shift?.startTime || !shift?.endTime) {
+    //     return res.status(400).json({
+    //       success: false,
+    //       message: "El empleado no tiene un turno programado para la fecha del permiso.",
+    //     });
+    //   }
+
+    //   const toMinutes = (time) => {
+    //     const [hours, minutes] = String(time).split(":").map(Number);
+    //     return hours * 60 + minutes;
+    //   };
+
+    //   const shiftStart = toMinutes(shift.startTime);
+    //   let shiftEnd = toMinutes(shift.endTime);
+    //   let permissionStart = toMinutes(normalizedPermissionStart);
+    //   let permissionEnd = toMinutes(normalizedPermissionEnd);
+    //   const isNightShift = shiftEnd <= shiftStart;
+
+    //   if (isNightShift) {
+    //     shiftEnd += 24 * 60;
+    //     if (permissionStart < shiftStart) permissionStart += 24 * 60;
+    //     if (permissionEnd < shiftStart) permissionEnd += 24 * 60;
+    //     if (permissionEnd <= permissionStart) permissionEnd += 24 * 60;
+    //   }
+
+    //   if (
+    //     permissionEnd <= permissionStart ||
+    //     permissionStart < shiftStart ||
+    //     permissionEnd > shiftEnd
+    //   ) {
+    //     return res.status(400).json({
+    //       success: false,
+    //       message: `El horario del permiso debe estar dentro del turno (${shift.startTime} - ${shift.endTime}).`,
+    //     });
+    //   }
+    // }
+
+    if (request) {
+      // Revisar si tiene permiso activo y autorizado
+      const [permisoActivoAuth] = await db.query(
+        `
+        SELECT * FROM permissionattendance_emp pa
+        where pa.date = '${dayjs(date).format(
+          "YYYY-MM-DD"
+        )}' and status and isApproved and pa.employeeID = ?;
+        `,
+        [employeeID]
+      );
+
+      // if (permisoActivoAuth.length > 0) {
+
+      //   return res.status(400).json({
+      //     success: false,
+      //     message: "Ya existe un permiso autorizado para este empleado.",
+      //   });
+      // }//por si acaso
+    }
+
+    // --- COMPORTAMIENTO IDÉNTICO AL ANTERIOR CON RESTRICCIÓN DE MENÚ ---
+    // Si el usuario tiene el menú ID 9, se respeta el 'isApproved' que mande el frontend.
+    // Si NO tiene el menú ID 9, se le obliga a ser false (no puede aprobar nada).
+    let allowedApproval = canApprovePermissions || isAssistantApprover;
+
+    // Se mantiene la restricción de que nadie se auto-aprueba sus propios permisos
+    let approved = employeeID === userData[0].employeeID ? false : allowedApproval;
+    // -------------------------------------------------------------------
+
+    const query = `
+      INSERT INTO permissionattendance_emp (
+        employeeID, permissionTypeID, date, line, exitTimePermission,
+        entryTimePermission, exitPermission, entryPermission, comment,coveredTime, request, isPaid, isApproved, approvedBy,
+        status, createdDate, createdBy
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    const values = [
+      employeeID,
+      permissionTypeID,
+      dayjs(date).format("YYYY-MM-DD"),
+      line,
+      isValidString(exitTimePermission)
+        ? dayjs(exitTimePermission).format("HH:mm")
+        : null,
+      isValidString(entryTimePermission)
+        ? dayjs(entryTimePermission).format("HH:mm")
+        : null,
+      isValidString(exitPermission) ? exitPermission : null,
+      isValidString(entryPermission) ? entryPermission : null,
+      isValidString(comment) ? comment : null,
+      coveredTime,
+      request,
+      isPaid,
+      approved,
+      approved ? userID : null,
+      status,
+      ...camposAuditoriaADD(req),
+    ];
+
+    const [result] = await db.query(query, values);
+
+    if (result.affectedRows === 1) {
+      const [permissionData] = await db.query(
+        `
+       SELECT
+        p.permissionID, pt.permissionTypeName, p.date, p.comment, p.coveredTime, p.line,
+        p.entryTimePermission, p.exitTimePermission, p.entryPermission, p.exitPermission,
+        concat(eu.firstName,' ', eu.middleName,' ',eu.lastName) createdBy, e.codeEmployee, e.managerID,
+        concat(e.firstName, ' ', e.middleName, ' ', e.lastName) employeeName, j.jobName,
+        TIMESTAMPDIFF(MINUTE,p.exitTimePermission, p.entryTimePermission) / 60 timeHours,
+        att.entryTime attendanceEntry,
+        um.email
+        from permissionattendance_emp p
+        inner join permissiontype_emp pt on p.permissionTypeID = pt.permissionTypeID
+        left join users_us u on p.createdBy = u.userID
+        left join employees_emp eu on u.employeeID = eu.employeeID
+        inner join employees_emp e on p.employeeID = e.employeeID
+        inner join jobs_emp j on j.jobID = e.jobID
+        left join users_us um on um.employeeID = e.managerID
+        left join (
+                SELECT employeeID, date, MIN(entryTime) AS entryTime
+                FROM h_attendance_emp
+                GROUP BY employeeID, date
+              ) att ON p.date = att.date AND p.employeeID = att.employeeID
+        where permissionID = ?;
+        `,
+        [result.insertId]
+      );
+
+      const [userAuthCheck] = await db.query(
+        `
+         SELECT 
+           u.userID,
+           u.username, 
+           u.email, 
+           EXISTS(
+             SELECT 1 
+             FROM usermenu_us um
+             WHERE um.userID = u.userID AND um.menuOptionID = 9
+           ) AS hasApprovePermission 
+         FROM users_us u
+         WHERE u.userID = ?;
+        `,
+        [userID]
+      );
+
+      if (userAuthCheck.length === 0) {
+        res.status(404).json({
+          success: false,
+          message:
+            "No se encontró un usuario asociado al empleado para notificar.",
+        });
+      }
+
+      if (approved) {
+        enviarCorreo(
+          permissionData[0].email,
+          "Creación de Permiso",
+          `
+        <h2>Creación de Permiso </h2>
+        <p>Se ha creado un nuevo permiso.</p>
+        <p>Permiso creado y aprobado por ${permissionData[0].createdBy}</p>
+        <p>Detalles del permiso (#${permissionData[0].permissionID}):</p>
+        <ul>
+          <li>Empleado: ${permissionData[0].employeeName}
+          (${permissionData[0].codeEmployee})
+          ${permissionData[0].line ? ` Linea ${permissionData[0].line}` : ""}
+          </li>
+          <li>Entrada: ${permissionData[0].attendanceEntry
+            ? permissionData[0].attendanceEntry
+            : "Sin entrada registrada"
+          }</li>
+        <li>Puesto: ${permissionData[0].jobName}</li>
+        <li>Motivo: ${permissionData[0].permissionTypeName}</li>
+        <li>Tipo: ${request ? `Solicitud` : `Diferido`}</li>
+        <li>Fecha: ${dayjs(permissionData[0].date).format("YYYY-MM-DD")}
+          ${permissionData[0].exitTimePermission
+            ? `de ${permissionData[0].exitTimePermission}
+              a ${permissionData[0].entryTimePermission} (${parseFloat(
+              permissionData[0].timeHours
+            ).toFixed(2)} horas)`
+            : ""
+          } ${permissionData[0].coveredTime
+            ? `(Puesto cubierto)`
+            : `(Puesto no cubierto)`
+          }</li>
+          <li>Comentario: ${permissionData[0].comment
+            ? permissionData[0].comment
+            : "Sin comentario"
+          }</li>
+        </ul>
+      `
+        );
+
+        await printPermissionTicket(result.insertId, "solicitud").catch(
+          (printErr) => {
+            console.error(
+              "Error al imprimir ticket automáticamente:",
+              printErr
+            );
+          }
+        );
+      } else {
+        enviarCorreo(
+          permissionData[0].email,
+          "Permiso por autorizar",
+          `
+      <h2>PERMISO POR AUTORIZAR</h2>
+      <p>Se ha solicitado un permiso que requiere su autorización.</p>
+      <p>Permiso creado por ${permissionData[0].createdBy}</p>
+      <p>Detalles del permiso (#${permissionData[0].permissionID}):</p>
+      <ul>
+        <li>Empleado: ${permissionData[0].employeeName}
+        (${permissionData[0].codeEmployee})
+        ${permissionData[0].line ? ` Linea ${permissionData[0].line}` : ""}</li>
+        <li>Entrada: ${permissionData[0].attendanceEntry
+            ? permissionData[0].attendanceEntry
+            : "Sin entrada registrada"
+          }</li>
+        <li>Puesto: ${permissionData[0].jobName}</li>
+        <li>Motivo: ${permissionData[0].permissionTypeName}</li>
+        <li>Tipo: ${request ? `Solicitud` : `Diferido`}</li>
+        <li>Fecha: ${dayjs(permissionData[0].date).format("YYYY-MM-DD")}
+        ${permissionData[0].exitTimePermission
+            ? `de ${permissionData[0].exitTimePermission}
+            a ${permissionData[0].entryTimePermission} (${parseFloat(
+              permissionData[0].timeHours
+            ).toFixed(2)} horas)`
+            : ""
+          } ${permissionData[0].coveredTime
+            ? `(Puesto cubierto)`
+            : `(Puesto no cubierto)`
+          }
+        </li>
+        <li>Comentario: ${permissionData[0].comment
+            ? permissionData[0].comment
+            : "Sin comentario"
+          }</li>
+      </ul>
+      <br />
+      <a href="http://192.168.30.52:9002/permissionsSupervisor">Revisar Permiso</a>
+      <p>Por favor, revise y autorice el permiso a la brevedad.</p>
+      `
+        );
+      }
+      const insertedId = result.insertId;
+
+      io.emit("permission:new", {
+        permissionID: insertedId,
+        type: request ? "solicitado" : "diferido",
+      });
+
+      io.emit("actualizar_permisos_tabla");
+
+      res.status(201).json({
+        success: true,
+        message: "Permiso registrado correctamente.",
+      });
+    }
+  } catch (error) {
+    console.error("Error en authorizePermission:", error);
+    res.status(500).json({
+      success: false,
+      message: "Ocurrió un error en el servidor al intentar crear el permiso.",
+      error: error.message,
+    });
+  }
+};
+
+// Controlador para aprobar un permiso
+exports.approvedPermission = async (req, res) => {
+  try {
+    const { permissionID } = req.params;
+    let startShift = null;
+
+    const { isApproved } = req.body;
+    const userID = getUserIdFromToken(req);
+
+    // Obtener datos del permiso antes de actualizar
+    const [permissionData] = await db.query(
+      `
+      SELECT * FROM permissionattendance_emp WHERE permissionID = ?;
+      `,
+      [permissionID]
+    );
+
+
+    // CONTROL DE ERRORES: Validar si el permiso existe antes de desestructurar
+    if (!permissionData || permissionData.length === 0) {
+      return res.status(440).json({
+        success: false,
+        message: "El permiso solicitado no existe.",
+      });
+    }
+
+    const { employeeID, date, request } = permissionData[0];
+
+    const [userAuth] = await db.query(
+      `
+      SELECT
+        u.userID,
+        u.username,
+        u.email,
+        u.employeeID,
+        EXISTS(
+          SELECT 1
+          FROM usermenu_us um
+          WHERE um.userID = u.userID AND um.menuOptionID = 9
+        ) AS hasApprovePermission
+      FROM users_us u
+      WHERE u.userID = ?;
+      `,
+      [userID]
+    );
+
+    const [currentEmployeeData] = await db.query(
+      `SELECT managerID FROM employees_emp WHERE employeeID = ?;`,
+      [userAuth[0]?.employeeID]
+    );
+
+    const [permissionOwnerData] = await db.query(
+      `SELECT managerID FROM employees_emp WHERE employeeID = ?;`,
+      [employeeID]
+    );
+
+    const isAssistantApprover = Number(userAuth?.[0]?.employeeID) === 256;
+    const isAssistantForManager = isAssistantApprover &&
+      Boolean(currentEmployeeData[0]?.managerID) &&
+      Number(permissionOwnerData[0]?.managerID) === Number(currentEmployeeData[0]?.managerID);
+
+    // if (!userAuth[0]?.hasApprovePermission && !isAssistantForManager) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: "No tiene permisos para aprobar permisos.",
+    //   });
+    // }
+
+    const [results] = await db.query(
+      `
+      UPDATE permissionattendance_emp
+      SET isApproved = ?, approvedBy = ?
+      WHERE permissionID = ?
+    `,
+      [isApproved, userID, permissionID]
+    );
+
+
+
+    if (results.affectedRows === 0) {
+      return res.status(500).json({
+        message: "Permiso no encontrado o ya está aprobado.",
+      });
+    }
+    let errorPrint = "";
+    // Si el permiso fue aprobado, imprimir el ticket automáticamente
+    if (isApproved) {
+      const userID = getUserIdFromToken(req);
+
+      const [permissionData] = await db.query(
+        `
+       SELECT
+        p.permissionID, pt.permissionTypeName, p.date, p.comment, p.line, p.request,
+        p.entryTimePermission, p.exitTimePermission, p.entryPermission, p.exitPermission,
+        concat(eu.firstName,' ', eu.middleName,' ',eu.lastName) createdBy, e.codeEmployee, e.managerID,
+        concat(empAp.firstName,' ', empAp.middleName,' ',empAp.lastName) approvedByFullName,
+        concat(e.firstName, ' ', e.middleName, ' ', e.lastName) employeeName, j.jobName,
+        TIMESTAMPDIFF(MINUTE,p.exitTimePermission, p.entryTimePermission) / 60 timeHours,
+        att.entryTime attendanceEntry,
+        um.email
+        from permissionattendance_emp p
+        inner join permissiontype_emp pt on p.permissionTypeID = pt.permissionTypeID
+        left join users_us u on p.createdBy = u.userID
+        left join employees_emp eu on u.employeeID = eu.employeeID
+        left join users_us usAppr on p.approvedBy = usAppr.userID
+        left join employees_emp empAp on empAp.employeeID = usAppr.employeeID
+        inner join employees_emp e on p.employeeID = e.employeeID
+        inner join jobs_emp j on j.jobID = e.jobID
+        left join users_us um on um.employeeID = e.managerID
+        left join (
+                SELECT employeeID, date, MIN(entryTime) AS entryTime
+                FROM h_attendance_emp
+                GROUP BY employeeID, date
+              ) att ON p.date = att.date AND p.employeeID = att.employeeID
+        where permissionID = ?;
+        `,
+        [permissionID]
+      );
+
+      if (userAuth[0].employeeID !== permissionData[0].managerID) {
+        enviarCorreo(
+          permissionData[0].email,
+          "Permiso Autorizado",
+          `
+        <h2>Permiso Autorizado</h2>
+        <p>El permiso para ${permissionData[0].employeeName
+          } ha sido autorizado por ${permissionData[0].approvedByFullName}.</p>
+        <p>Detalles del permiso (#${permissionData[0].permissionID}):</p>
+        <ul>
+          <li>Empleado: ${permissionData[0].employeeName} 
+          (${permissionData[0].codeEmployee})
+          ${permissionData[0].line ? ` (Linea ${permissionData[0].line})` : ""
+          }</li>
+          <li>Entrada:  ${permissionData[0].attendanceEntry
+            ? permissionData[0].attendanceEntry
+            : "Sin entrada registrada"
+          }</li>
+        <li>Puesto: ${permissionData[0].jobName}</li>
+        <li>Motivo: ${permissionData[0].permissionTypeName}</li>
+        <li>Tipo: ${permissionData[0].request ? `Solicitud` : `Diferido`}</li>
+        <li>Fecha: ${dayjs(permissionData[0].date).format("YYYY-MM-DD")}
+                    ${permissionData[0].exitTimePermission
+            ? `de ${permissionData[0].exitTimePermission} 
+                        a ${permissionData[0].entryTimePermission
+            } (${parseFloat(permissionData[0].timeHours).toFixed(
+              2
+            )} horas)`
+            : ""
+          }</li>
+
+          <li>Comentario: ${permissionData[0].comment
+            ? permissionData[0].comment
+            : "Sin comentario"
+          }</li>
+        </ul>
+      `
+        );
+      }
+
+      // if (!request) {
+      //   let dayString = dayjs(date).locale("es").format("dddd").toUpperCase();
+
+      //   const [dataEmployee] = await db.query(
+      //     `
+      //     SELECT
+      //         e.codeEmployee, a.entryTime, s.shiftName, d.startTime, d.endTime, d.day
+      //     FROM employees_emp e
+      //     INNER JOIN jobs_emp j ON e.jobID = j.jobID
+      //     INNER JOIN shifts_emp s ON s.shiftID = e.shiftID
+      //     INNER JOIN detailsshift_emp d ON d.shiftID = s.shiftID
+      //     LEFT JOIN h_attendance_emp a
+      //         ON e.employeeID = a.employeeID
+      //       AND a.date = ?
+      //     WHERE e.employeeID = ?
+      //     AND d.day = ?;
+      // `,
+      //     [
+      //       dayjs(date).tz("America/Tegucigalpa").format("YYYY-MM-DD"),
+      //       employeeID,
+      //       dayString,
+      //     ]
+      //   );
+
+      //   // startShift = dataEmployee[0].entryTime
+      //   //   ? dataEmployee[0]?.startTime
+      //   //   : null;
+
+      //   // if (startShift) {
+      //   //   // Actualizar la hora de entrada en h_attendance_emp si el permiso es aprobado y tiene hora de inicio de turno
+      //   //   await db.query(
+      //   //     `
+      //   //   UPDATE h_attendance_emp
+      //   //   SET entryTime = ?
+      //   //   WHERE employeeID = ? AND date = ?`,
+      //   //     [
+      //   //       startShift,
+      //   //       employeeID,
+      //   //       dayjs(date).tz("America/Tegucigalpa").format("YYYY-MM-DD"),
+      //   //     ]
+      //   //   );
+      //   // }
+      // }
+
+      await printPermissionTicket(permissionID, "solicitud").catch(
+        (printErr) => {
+          console.error("Error al imprimir ticket automáticamente:", printErr);
+          errorPrint = "No hay impresoras locales conectadas.";
+        }
+      );
+    }
+
+    io.emit("permission:approved", { permissionID });
+
+    io.emit("actualizar_permisos_tabla");
+
+    res.json({
+      message: "Permiso aprobado correctamente",
+      results,
+      errorPrint,
+    });
+  } catch (err) {
+    console.error("Error approving permission:", err);
+    res.status(500).json({
+      message: "Error al aprobar el permiso",
+      error: err.message,
+    });
+  }
+};
+// Controlador para eliminar un permiso
+exports.deletePermission = async (req, res) => {
+  try {
+    const { permissionID } = req.params;
+    const [results] = await db.query(
+      `
+      DELETE FROM permissionattendance_emp
+      WHERE permissionID = ?
+    `,
+      [permissionID]
+    );
+    if (results.affectedRows === 0) {
+      return res.status(404).json({
+        message: "Permiso no encontrado.",
+      });
+    }
+
+    io.emit("permission:deleted", { permissionID });
+    io.emit("actualizar_permisos_tabla");
+
+    res.json({ message: "Permiso eliminado correctamente.", results });
+  } catch (err) {
+    console.error("Error deleting permission:", err);
+    res.status(500).json({
+      message: "Error al eliminar el permiso",
+      error: err.message,
+    });
+  }
+};
+
+//Endpoint para editar los permisos dentro de detalle
+
+exports.editPermissionTime = async (req, res) => {
+  try {
+    const { permissionID, field, newTime } = req.body;
+    if (!permissionID || !field || !newTime) {
+      return res.status(400).json({
+        success: false,
+        message: "permissionID, field y newTime son requeridos",
+      });
+    }
+
+    const [[perm]] = await db.query(
+      `SELECT request, exitPermission, entryPermission, exitTimePermission, entryTimePermission, lunchTime
+         FROM permissionattendance_emp
+        WHERE permissionID = ?`,
+      [permissionID]
+    );
+    if (!perm) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Permiso no encontrado" });
+    }
+
+    // === PERMITIR EDITAR CUALQUIERA DE LOS 4 CAMPOS ===
+    const allowed = ["exitPermission", "entryPermission"];
+    if (!allowed.includes(field)) {
+      return res.status(400).json({
+        success: false,
+        message: `Campo no permitido. Usa: ${allowed.join(", ")}`,
+      });
+    }
+
+    // Validación de formato y orden lógico del par correspondiente
+    const hhmmss = String(newTime).trim();
+    if (!/^\d{2}:\d{2}:\d{2}$/.test(hhmmss)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Formato inválido. Usa HH:mm:ss" });
+    }
+    const toSec = (t) =>
+      t
+        ? t
+          .split(":")
+          .map(Number)
+          .reduce((s, v, i) => s + v * [3600, 60, 1][i], 0)
+        : null;
+
+    // Clonar y colocar el cambio para evaluar el orden
+    const next = { ...perm, [field]: hhmmss };
+
+    if (field === "isPaid") {
+      await db.query(
+        "UPDATE permissionattendance_emp SET isPaid=? WHERE permissionID=?",
+        [newValue ? 1 : 0, permissionID]
+      );
+      return res.json({ success: true });
+    }
+
+    // Si se edita un campo REAL, validar par real; si es OTORGADO, validar par otorgado
+    if (field === "exitPermission" || field === "entryPermission") {
+      const a = next.exitPermission; // SxP real
+      const b = next.entryPermission; // SxR real
+      if (a && b && toSec(a) > toSec(b)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "La salida real (SxP) no puede ser mayor que el regreso real (SxR).",
+        });
+      }
+    } else {
+      const a = next.exitPermission; // SxP real
+      const b = next.entryPermission; // SxR real // otorgado fin
+      if (a && b && toSec(a) > toSec(b)) {
+        return res.status(400).json({
+          success: false,
+          message: "La hora otorgada de inicio no puede ser mayor a la de fin.",
+        });
+      }
+    }
+
+    // Actualizar
+    await db.query(
+      `UPDATE permissionattendance_emp
+          SET ${field} = ?, updatedDate = NOW(), updatedBy = ?
+        WHERE permissionID = ?`,
+      [hhmmss, getUserIdFromToken(req) || null, permissionID]
+    );
+
+    // Tiempo real
+    io.emit("permission:updatedTime", {
+      permissionID,
+      field, // cualquiera de los 4
+      value: hhmmss, // 'HH:mm:ss'
+    });
+
+    return res.json({ success: true, message: "Hora actualizada" });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      success: false,
+      message: "No se pudo editar la hora",
+      error: err.message,
+    });
+  }
+};
+
+//Endpoint para ver el datalle del empleado del permiso o asistencia
+exports.getPermissionDetailsForAttendance = async (req, res) => {
+  try {
+    const { employeeID, date } = req.query;
+    if (!employeeID || !date) {
+      return res
+        .status(400)
+        .json({ success: false, message: "employeeID y date son requeridos" });
+    }
+
+    const [rows] = await db.query(
+      `
+        SELECT
+          h.employeeID,
+          DATE(h.date) AS attendanceDate, p.lunchTime,
+          h.entryTime, h.exitTime,
+          -- empleado
+          e.codeEmployee,
+          CONCAT(e.firstName,' ',COALESCE(e.middleName,''),' ',e.lastName,' ',COALESCE(e.secondLastName,'')) AS employeeName,
+          e.photoUrl,
+          -- permisos (mismo día)
+          p.permissionID, DATE(p.date) AS permissionDate,
+          p.exitPermission, p.entryPermission,
+          p.exitTimePermission, p.entryTimePermission,
+          p.comment, p.status, p.isApproved, p.isPaid, p.coveredTime,
+          p.request, p.permissionTypeID, pt.permissionTypeName,
+          -- etiquetas legibles
+          CASE p.request WHEN 0 THEN 'Diferido' WHEN 1 THEN 'Solicitado' ELSE 'Desconocido' END AS permissionTypeLabel,
+          CASE p.isPaid WHEN 1 THEN 'Pagado' ELSE 'No pagado' END AS paidLabel,
+          CASE p.coveredTime WHEN 1 THEN 'Cubre tiempo' ELSE 'No cubre' END AS coveredTimeLabel,
+          CASE p.status WHEN 1 THEN 'Activo' ELSE 'Inactivo' END AS statusLabel,
+          CASE p.isApproved WHEN 1 THEN 'Aprobado' WHEN 0 THEN 'Pendiente' ELSE 'Desconocido' END AS approvalStatus,
+          -- auditoría
+          p.createdDate, p.createdBy,
+          CONCAT(cre.firstName,' ',COALESCE(cre.middleName,''),' ',cre.lastName) AS createdByName,
+          p.approvedBy,
+          CONCAT(apr.firstName,' ',COALESCE(apr.middleName,''),' ',apr.lastName) AS approvedByName
+        FROM permissionattendance_emp p 
+        LEFT JOIN employees_emp e ON e.employeeID = p.employeeID
+        LEFT JOIN (
+            SELECT employeeID, date, MIN(entryTime) AS entryTime, MIN(exitTime) AS exitTime
+            FROM h_attendance_emp
+            GROUP BY employeeID, date
+        ) h 
+            ON p.date = h.date AND p.employeeID = h.employeeID
+        LEFT JOIN permissiontype_emp pt ON pt.permissionTypeID = p.permissionTypeID
+        LEFT JOIN users_us ucre ON ucre.userID = p.createdBy
+        LEFT JOIN employees_emp cre ON cre.employeeID = ucre.employeeID
+        LEFT JOIN users_us uapr ON uapr.userID = p.approvedBy
+        LEFT JOIN employees_emp apr ON apr.employeeID = uapr.employeeID
+        WHERE p.employeeID = ? 
+          AND DATE(p.date) = DATE(?)
+        ORDER BY p.permissionID DESC;
+    `,
+      [employeeID, date]
+    );
+
+    const [types] = await db.query(
+      `SELECT permissionTypeID, permissionTypeName FROM permissiontype_emp`
+    );
+    res.json({ success: true, data: rows, types });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: "Error en servidor",
+      error: err.message,
+    });
+  }
+};
+
+// === Detalle de Permiso (header + líneas) ===
+exports.getPermissionAndDetails = async (req, res) => {
+  try {
+    const { permissionID } = req.params;
+
+    const [headerRows] = await db.query(
+      `
+      SELECT 
+        pa.permissionID, pa.employeeID, pa.date, pa.lunchTime,
+        pa.exitPermission, pa.entryPermission,
+        pa.exitTimePermission, pa.entryTimePermission,
+        pa.request, pa.isPaid,
+        p.permissionTypeName,
+        CONCAT(e.firstName,' ',COALESCE(e.middleName,''),' ',e.lastName,' ',e.secondLastName) AS employeeName
+      FROM permissionattendance_emp pa
+      INNER JOIN permissiontype_emp p ON p.permissionTypeID = pa.permissionTypeID
+      INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+      WHERE pa.permissionID = ?;
+      `,
+      [permissionID]
+    );
+
+    const [detailRows] = await db.query(
+      `
+      SELECT 
+        detailPermissionID, permitStartTime, permitEndTime, comment, withPay, lunchTime,
+        COALESCE(ausence_permissions, 0) AS ausence_permissions
+      FROM detailpermission_emp
+      WHERE permissionID = ?
+      ORDER BY detailPermissionID ASC;
+      `,
+      [permissionID]
+    );
+
+    return res.json({
+      success: true,
+      header: headerRows[0] || null,
+      details: detailRows || [],
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al cargar el detalle." });
+  }
+};
+
+// === Crear línea de detalle (dentro del permiso) ===
+exports.createPermissionDetail = async (req, res) => {
+  try {
+    const { permissionID } = req.params;
+    const {
+      permitStartTime,
+      permitEndTime,
+      comment,
+      withPay,
+      lunchTime,
+      ausence_permissions,
+    } = req.body;
+
+    const start = normalizeTimeToSQL(permitStartTime);
+    const end = normalizeTimeToSQL(permitEndTime);
+
+    if (!start || !end) {
+      return res.status(400).json({
+        success: false,
+        message: "Horas inválidas (usa HH:mm o HH:mm:ss o hh:mm a).",
+      });
+    }
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: "El inicio no puede ser mayor que el fin.",
+      });
+    }
+
+    await db.query(
+      `
+    INSERT INTO detailpermission_emp (permissionID, permitStartTime, permitEndTime, comment, withPay, lunchTime,ausence_permissions, createdDate, createdBy)
+    VALUES (?,?,?,?,?,?,?,?)
+    `,
+      [
+        permissionID,
+        start,
+        end,
+        isValidString(comment) ? comment : null,
+        Number(withPay) ? 1 : 0,
+        Number(lunchTime) ? 1 : 0,
+        Number(ausence_permissions) ? 1 : 0,
+        camposAuditoriaADD(req),
+      ]
+    );
+
+    return res.json({ success: true, message: "Detalle agregado." });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al crear el detalle." });
+  }
+};
+
+// === Actualizar línea de detalle (dentro del permiso) ===
+exports.updatePermissionDetail = async (req, res) => {
+  try {
+    const { permissionID, detailPermissionID } = req.params;
+    const {
+      permitStartTime,
+      permitEndTime,
+      comment,
+      withPay,
+      lunchTime,
+    } = req.body;
+
+    const start = normalizeTimeToSQL(permitStartTime);
+    const end = normalizeTimeToSQL(permitEndTime);
+
+    if (!start || !end) {
+      return res.status(400).json({
+        success: false,
+        message: "Horas inválidas (usa HH:mm o HH:mm:ss o hh:mm a).",
+      });
+    }
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: "El inicio no puede ser mayor que el fin.",
+      });
+    }
+
+    const [result] = await db.query(
+      `UPDATE detailpermission_emp
+       SET permitStartTime = ?, permitEndTime = ?, comment = ?, withPay = ?, lunchTime = ?
+       WHERE permissionID = ? AND detailPermissionID = ?`,
+      [
+        start,
+        end,
+        isValidString(comment) ? comment : null,
+        Number(withPay) ? 1 : 0,
+        Number(lunchTime) ? 1 : 0,
+        permissionID,
+        detailPermissionID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      const [rows] = await db.query(
+        `SELECT detailPermissionID
+         FROM detailpermission_emp
+         WHERE permissionID = ? AND detailPermissionID = ?`,
+        [permissionID, detailPermissionID]
+      );
+
+      if (rows.length === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Detalle no encontrado." });
+      }
+    }
+
+    io.emit("permissiondetail:updated", { permissionID, detailPermissionID });
+    return res.json({ success: true, message: "Detalle actualizado." });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al actualizar el detalle." });
+  }
+};
+
+// === Eliminar línea de detalle ===
+exports.deletePermissionDetail = async (req, res) => {
+  try {
+    const { permissionID, detailPermissionID } = req.params;
+
+    const [r] = await db.query(
+      `DELETE FROM detailpermission_emp 
+       WHERE permissionID = ? AND detailPermissionID = ?`,
+      [permissionID, detailPermissionID]
+    );
+
+    if (r.affectedRows === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Detalle no encontrado." });
+    }
+
+    // notifica a clientes (opcional)
+    io.emit("permissiondetail:deleted", { permissionID, detailPermissionID });
+
+    return res.json({ success: true, message: "Detalle eliminado." });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al eliminar el detalle." });
+  }
+};
+
+// si también guardarás Hora Estimada campo a campo
+exports.updateEstimatedTime = async (req, res) => {
+  try {
+    const { permissionID, field, newTime } = req.body;
+
+    if (!permissionID || !field) {
+      return res.status(400).json({ success: false, message: "Faltan datos." });
+    }
+    if (!["exitTimePermission", "entryTimePermission"].includes(field)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Campo inválido." });
+    }
+    if (!newTime) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Falta la hora." });
+    }
+
+    const normalized = normalizeTimeToSQL(newTime); // HH:mm:ss
+    if (!normalized) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Formato de hora inválido." });
+    }
+
+    const [r] = await db.query(
+      `UPDATE permissionattendance_emp SET ${field}=?, updatedDate=NOW(), updatedBy=? WHERE permissionID=?`,
+      [normalized, getUserIdFromToken(req) || null, permissionID]
+    );
+
+    // 👇 NO dispares 'permission:updated' aquí (evita recarga/parpadeo).
+    if (typeof io !== "undefined") {
+      io.emit("permission:estimatedTimeUpdated", {
+        permissionID,
+        field,
+        value: normalized,
+      });
+    }
+
+    return res.json({
+      success: r.affectedRows > 0,
+      message: "Hora estimada actualizada.",
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al actualizar hora estimada." });
+  }
+};
+
+function parseTime(horaStr) {
+  if (!horaStr) return null;
+  const [h, m] = horaStr.split(":").map(Number);
+  const date = new Date();
+  date.setHours(h, m, 0, 0);
+  return date;
+}
+
+function diffHoras(inicio, fin) {
+  return Math.max((fin - inicio) / 3600000, 0);
+}
+
+function calcularHorasEmpleado({
+  turnoInicio,
+  turnoFin,
+  permisos,
+  entrada,
+  salida,
+}) {
+  const LUNCH_HOURS = 0.75;
+
+  turnoInicio = parseTime(turnoInicio);
+  turnoFin = parseTime(turnoFin);
+  entrada = parseTime(entrada);
+  salida = parseTime(salida);
+
+  // --- 1️⃣ Horas del turno ---
+  const horasTurno = diffHoras(turnoInicio, turnoFin);
+
+  // --- 2️⃣ Permisos ---
+  let horasPermiso = 0;
+  let permisoConAlmuerzo = false;
+  permisos.forEach((p) => {
+    const pInicio = parseTime(p.permitStartTime);
+    const pFin = parseTime(p.permitEndTime);
+    horasPermiso += diffHoras(pInicio, pFin);
+    if (p.lunchTime) permisoConAlmuerzo = true;
+  });
+
+  // --- 3️⃣ Horas trabajadas ---
+  let trabajoInicio = entrada
+    ? entrada < turnoInicio
+      ? turnoInicio
+      : entrada
+    : turnoInicio;
+  let trabajoFin = salida ? (salida > turnoFin ? turnoFin : salida) : turnoFin;
+  let horasTrabajadas = diffHoras(trabajoInicio, trabajoFin);
+
+  // --- 4️⃣ Calcular huecos sin justificar (ausencias) ---
+  permisos.sort(
+    (a, b) => parseTime(a.permitStartTime) - parseTime(b.permitStartTime)
+  );
+  let horasAusente = 0;
+  let cursor = turnoInicio;
+
+  permisos.forEach((p) => {
+    const pInicio = parseTime(p.permitStartTime);
+    const pFin = parseTime(p.permitEndTime);
+
+    // Si hay hueco entre cursor y inicio del permiso
+    if (pInicio > cursor && pInicio > entrada) {
+      const desde = cursor < entrada ? entrada : cursor;
+      const hasta = pInicio > salida ? salida : pInicio;
+      horasAusente += diffHoras(desde, hasta);
+    }
+
+    // Actualizar cursor
+    if (pFin > cursor) cursor = pFin;
+  });
+
+  // Hueco después del último permiso antes de la entrada
+  if (cursor < trabajoInicio) horasAusente += diffHoras(cursor, trabajoInicio);
+
+  // --- 5️⃣ Aplicar descuento de almuerzo ---
+  if (permisoConAlmuerzo) {
+    horasPermiso = Math.max(horasPermiso - LUNCH_HOURS, 0);
+  } else {
+    horasTrabajadas = Math.max(horasTrabajadas - LUNCH_HOURS, 0);
+  }
+
+  // --- 6️⃣ Ajustar totales ---
+  const total = horasPermiso + horasTrabajadas + horasAusente;
+  const diferencia = horasTurno - total;
+  if (Math.abs(diferencia) > 0.05) {
+    horasAusente = Math.max(horasAusente + diferencia, 0);
+  }
+
+  return {
+    horasTurno: horasTurno.toFixed(2),
+    horasPermiso: horasPermiso.toFixed(2),
+    horasTrabajadas: horasTrabajadas.toFixed(2),
+    horasAusente: horasAusente.toFixed(2),
+    descuentoAlmuerzo: permisoConAlmuerzo
+      ? "Restado del permiso"
+      : "Restado del trabajo",
+  };
+}
+
+function calcularResumen(permisos, turnos) {
+  const agrupados = {};
+
+  // Agrupar por empleado y fecha
+  for (const p of permisos) {
+    const key = `${p.codeEmployee}-${dayjs(p.date).format("YYYY-MM-DD")}`;
+    if (!agrupados[key]) agrupados[key] = [];
+    agrupados[key].push(p);
+  }
+
+  const resultados = [];
+
+  for (const [key, listaPermisos] of Object.entries(agrupados)) {
+    const ejemplo = listaPermisos[0];
+    const fecha = dayjs(ejemplo.date).format("YYYY-MM-DD");
+    const diaSemana = dayjs(fecha).format("dddd").toUpperCase();
+
+    // Buscar turno correspondiente
+    const turno = turnos.find(
+      (t) => t.shiftID === ejemplo.shiftID && t.day === diaSemana
+    );
+
+    if (!turno) continue;
+
+    const resultado = calcularHorasEmpleado({
+      turnoInicio: turno.startTime,
+      turnoFin: turno.endTime,
+      permisos: listaPermisos,
+      entrada: ejemplo.entryTime,
+      salida: ejemplo.exitTime,
+    });
+
+    resultados.push({
+      codeEmployee: ejemplo.codeEmployee,
+      fullName: ejemplo.fullName,
+      fecha,
+      horasTurno: resultado.horasTurno,
+      horasPermiso: resultado.horasPermiso,
+      horasTrabajadas: resultado.horasTrabajadas,
+      horasAusente: resultado.horasAusente,
+      descuentoAlmuerzo: resultado.descuentoAlmuerzo,
+    });
+  }
+
+  return resultados;
+}
+
+// Calculo para horas trabajadas, tiempo en permiso y horas en ausente
+exports.calculateTime = async (req, res) => {
+  try {
+    // Obtener datos de los turno
+    const [turnos] = await db.query(
+      `
+   SELECT shiftID, day, startTime, endTime FROM detailsshift_emp;
+    `
+    );
+
+    // Obtener datos del permiso
+    const [permisos] = await db.query(
+      `
+              SELECT DISTINCT
+          e.codeEmployee,
+          CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) AS fullName,
+          payType.payrollName AS Planilla,
+          COALESCE(hs.shiftID, e.shiftID) AS shiftID, p.date,
+          p.permissionID,
+          IF(dp.permitStartTime, dp.permitStartTime, p.exitPermission)  AS permitStartTime,
+          IF(dp.permitEndTime,   dp.permitEndTime,   p.entryPermission) AS permitEndTime,
+          -- horas del permiso
+          IF(
+              dp.permitStartTime IS NOT NULL,
+              TIMESTAMPDIFF(MINUTE, dp.permitStartTime, dp.permitEndTime) / 60,
+              TIMESTAMPDIFF(MINUTE, p.exitPermission, p.entryPermission) / 60 
+          ) AS permisoHours,
+          IFNULL(NULLIF(TRIM(dp.comment), ''), '-') AS commentText,
+          -- regla de pago
+          CASE 
+              WHEN dp.withPay IS NOT NULL THEN 
+                  CASE dp.withPay WHEN 1 THEN 'Con goce' ELSE 'Sin goce' END
+              ELSE 
+                  CASE p.isPaid  WHEN 1 THEN 'Con goce' ELSE 'Sin goce' END
+          END AS Pago,
+		  -- regla de almuerzo
+          CASE 
+              WHEN dp.lunchTime IS NOT NULL THEN 
+                  CASE dp.lunchTime WHEN 1 THEN true ELSE false END
+              ELSE 
+                  CASE p.lunchTime  WHEN 1 THEN true ELSE false END
+          END AS lunchTime,
+          h.employeeID, h.entryTime, h.exitTime
+          FROM permissionattendance_emp p
+          LEFT JOIN detailpermission_emp dp ON dp.permissionID = p.permissionID
+          INNER JOIN employees_emp e         ON e.employeeID = p.employeeID
+          LEFT JOIN h_attendance_emp h
+		  ON h.employeeID = e.employeeID
+		  AND h.date between ? AND ?
+          INNER JOIN payrolltype_emp payType ON payType.payrollTypeID = e.payrollTypeID
+          LEFT JOIN h_assigmentshift_emp hs
+            ON hs.employeeID = e.employeeID
+           AND DATE(hs.startDate) <= DATE(p.date)
+           AND (hs.endDate IS NULL OR DATE(hs.endDate) >= DATE(p.date))
+          WHERE p.date BETWEEN ? AND ?
+            AND p.isApproved = 1
+          ORDER BY p.date ASC, e.codeEmployee ASC;
+    `,
+      ["20251006", "20251006", "20251006", "20251006"]
+    );
+
+    const resultados = calcularResumen(permisos, turnos);
+
+    return res
+      .status(200)
+      .json({ success: true, data: resultados, message: "Cálculo realizado." });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error al calcular tiempos." });
+  }
+};
+
+// exports.disabilityPage = async (req, res) => {
+//   try {
+//     const { page = 1, limit = 50, q = "", from = "", to = "" } = req.query;
+//     const offset = (Number(page) - 1) * Number(limit);
+//     const like = `%${q}%`;
+
+//     const sql = `
+//   SELECT
+//     d.disabilityID,
+//     d.disabilityTypeID,
+//     d.extByID,
+//     exd.name AS extByName,
+//     d.employeeID,
+
+//     e.codeEmployee,
+//     CONCAT(COALESCE(e.firstName,''),' ',COALESCE(e.lastName,'')) AS employeeName,
+//     dt.disabilityName AS disabilityTypeName,
+//     d.startDate,
+//     d.endDate,
+//     d.documentation,
+//     d.comment,
+//     d.createdDate,
+//     d.createdBy,
+//     d.updatedDate,
+//     d.updatedBy
+//   FROM disability_emp AS d
+//   LEFT JOIN employees_emp AS e ON e.employeeID = d.employeeID
+//   LEFT JOIN disabilitytype_emp AS dt ON dt.disabilityTypeID = d.disabilityTypeID
+//   LEFT JOIN extdisability_emp AS exd ON exd.extByID = d.extByID
+//   WHERE (? = ''
+//     OR e.firstName LIKE ?
+//     OR e.lastName LIKE ?
+//     OR e.codeEmployee LIKE ?
+//     OR dt.disabilityName LIKE ?
+//     OR d.comment LIKE ?
+//     OR exd.name LIKE ?
+//   )
+//   ${from && to ? "AND NOT (DATE(d.endDate) < DATE(?) OR DATE(d.startDate) > DATE(?))" : ""}
+//   ORDER BY d.createdDate DESC
+//   LIMIT ? OFFSET ?;
+// `;
+
+//    const params = [
+//   q, like, like, like, like, like, like,
+//   ...(from && to ? [from, to] : []),
+//   Number(limit), Number(offset),
+// ];
+//     const [rows] = await db.query(sql, params);
+
+//     const countSql = `
+//       SELECT COUNT(*) AS total
+//       FROM disability_emp AS d
+//       LEFT JOIN employees_emp AS e ON e.employeeID = d.employeeID
+//       LEFT JOIN disabilitytype_emp AS dt ON dt.disabilityTypeID = d.disabilityTypeID
+//         LEFT JOIN extdisability_emp AS exd ON exd.extByID = d.extByID
+//       WHERE (? = ''
+//         OR e.firstName LIKE ?
+//         OR e.lastName LIKE ?
+//         OR e.codeEmployee LIKE ?
+//         OR dt.disabilityName LIKE ?
+//         OR d.comment LIKE ?
+//         OR exd.name LIKE ?
+//       );
+//     `;
+//     const [[{ total }]] = await db.query(countSql, [
+//       q,
+//       like,
+//       like,
+//       like,
+//       like,
+//       like,
+//       like,
+//     ]);
+
+//     return res.json({
+//       success: true,
+//       data: rows,
+//       page: Number(page),
+//       limit: Number(limit),
+//       total,
+//     });
+//   } catch (err) {
+//     console.error("disabilityPage error:", err);
+//     return res
+//       .status(500)
+//       .json({ success: false, message: "Error obteniendo incapacidades." });
+//   }
+// };
+
+exports.disabilityPage = async (req, res) => {
+  try {
+    const { page = 1, limit = 50, q = "", from = "", to = "" } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    const like = `%${q}%`;
+
+    const sql = `
+  SELECT
+    d.disabilityID,
+    d.disabilityTypeID,
+    d.extByID,
+    exd.name AS extByName,
+    d.employeeID,
+    d.weekPaid,
+    e.codeEmployee,
+    CONCAT(COALESCE(e.firstName,''),' ',COALESCE(e.lastName,'')) AS employeeName,
+    dt.disabilityName AS disabilityTypeName,
+    d.startTime,
+    d.startDate,
+    d.endDate,
+    d.documentation,
+    d.comment,
+    d.createdDate,
+    d.createdBy,
+    d.updatedDate,
+    d.updatedBy
+  FROM disability_emp AS d
+  LEFT JOIN employees_emp AS e ON e.employeeID = d.employeeID
+  LEFT JOIN disabilitytype_emp AS dt ON dt.disabilityTypeID = d.disabilityTypeID
+  LEFT JOIN extdisability_emp AS exd ON exd.extByID = d.extByID
+  WHERE (? = ''
+    OR e.firstName LIKE ?
+    OR e.lastName LIKE ?
+    OR e.codeEmployee LIKE ?
+    OR dt.disabilityName LIKE ?
+    OR d.comment LIKE ?
+    OR exd.name LIKE ?
+  )
+  ${from && to ? "AND NOT (DATE(d.endDate) < DATE(?) OR DATE(d.startDate) > DATE(?))" : ""}
+  ORDER BY d.createdDate DESC
+  LIMIT ? OFFSET ?;
+`;
+
+    const params = [
+      q, like, like, like, like, like, like,
+      ...(from && to ? [from, to] : []),
+      Number(limit), Number(offset),
+    ];
+    const [rows] = await db.query(sql, params);
+
+    const countSql = `
+      SELECT COUNT(*) AS total
+      FROM disability_emp AS d
+      LEFT JOIN employees_emp AS e ON e.employeeID = d.employeeID
+      LEFT JOIN disabilitytype_emp AS dt ON dt.disabilityTypeID = d.disabilityTypeID
+        LEFT JOIN extdisability_emp AS exd ON exd.extByID = d.extByID
+      WHERE (? = ''
+        OR e.firstName LIKE ?
+        OR e.lastName LIKE ?
+        OR e.codeEmployee LIKE ?
+        OR dt.disabilityName LIKE ?
+        OR d.comment LIKE ?
+        OR exd.name LIKE ?
+      );
+    `;
+    const [[{ total }]] = await db.query(countSql, [
+      q,
+      like,
+      like,
+      like,
+      like,
+      like,
+      like,
+    ]);
+
+    return res.json({
+      success: true,
+      data: rows,
+      page: Number(page),
+      limit: Number(limit),
+      total,
+    });
+  } catch (err) {
+    console.error("disabilityPage error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error obteniendo incapacidades." });
+  }
+};
+
+exports.addDisability = async (req, res) => {
+  const {
+    disabilityTypeID,
+    extByID,
+    employeeID,
+    weekPaid,
+    startTime,
+    startDate,
+    endDate,
+    documentation,
+    comment,
+    deletePermission,
+    permByDateInfo
+  } = req.body;
+
+  try {
+
+    const normalizeTime = (v) => {
+      if (!v) return dayjs().format("HH:mm:ss"); // default: ahora
+      const s = String(v).trim();
+
+      // acepta HH:mm o HH:mm:ss
+      const re = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+      if (!re.test(s)) return null;
+
+      return s.length === 5 ? `${s}:00` : s; // HH:mm -> HH:mm:ss
+    };
+
+    const startTimeDB = normalizeTime(startTime);
+    if (!startTimeDB) {
+      return res.status(400).json({
+        success: false,
+        message: "Hora inválida. Usa formato HH:mm o HH:mm:ss.",
+      });
+    }
+
+    // Revisar si no hay una incapacidad del mismo empleado que se solape en fechas
+    const [overlap] = await db.query(
+      `SELECT disabilityID FROM disability_emp
+        WHERE employeeID = ?
+          AND NOT (DATE(endDate) < DATE(?) OR DATE(startDate) > DATE(?))`,
+      [employeeID, startDate, endDate]
+    );
+
+    if (overlap.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "El empleado ya tiene una incapacidad que se solapa en fechas.",
+      });
+    }
+
+    const [result] = await db.query(
+      `INSERT INTO disability_emp (disabilityTypeID, extByID, employeeID,  weekPaid, startTime,
+       startDate, endDate, documentation, comment ,createdDate, createdBy)
+       VALUES (?, ?, ?, ?, ?, ?,?, ?, ?, ?, ?)`,
+      [
+        disabilityTypeID,
+        extByID || null,
+        employeeID,
+        // dayjs().format("HH:mm:ss"), //startTime || null,
+        parseInt(weekPaid) || dayjs().isoWeek(), // Si no se proporciona, se asigna la semana actual
+        startTimeDB,
+        dayjs(startDate).format("YYYY-MM-DD"),
+        dayjs(endDate).format("YYYY-MM-DD"),
+        documentation,
+        comment,
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+    // Si se inserta la incapacidad y se indica eliminar permisos, proceder a eliminar el permisos afectado
+    if (deletePermission) {
+      await db.query(
+        `DELETE FROM permissionattendance_emp WHERE permissionID = ?`,
+        [permByDateInfo.permissionID]
+      );
+    }
+
+    // const [datosIncapacidad] = await db.query(
+    //   `SELECT 
+    //     e.codeEmployee, 
+    //     CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) AS fullName,
+    //     e.managerID, u.username, u.email,
+    //     d.disabilityID, d.startDate, d.endDate, d.comment, dt.disabilityName
+    //     FROM disability_emp d
+    //     inner join disabilitytype_emp dt on d.disabilityTypeID = dt.disabilityTypeID
+    //     inner join  employees_emp e on d.employeeID = e.employeeID
+    //     inner join users_us u on e.managerID = u.employeeID
+    //     where disabilityID = ?;`,
+    //   [result.insertId]
+    // );
+
+    // enviarCorreo(
+    //   datosIncapacidad[0].email,
+    //   "Notificación de Incapacidad",
+    //   `
+    //     <h2>Notificación de Incapacidad</h2>
+    //     <p>Detalles de la incapacidad:</p>
+    //     <ul>
+    //       <li>Empleado: ${datosIncapacidad[0].fullName} (${
+    //     datosIncapacidad[0].codeEmployee
+    //   })</li>
+    //       <li>Tipo de Incapacidad: ${datosIncapacidad[0].disabilityName}</li>
+    //       <li>Fecha de Inicio: ${dayjs(datosIncapacidad[0].startDate).format(
+    //         "DD/MM/YYYY"
+    //       )}</li>
+    //       <li>Fecha de Fin: ${dayjs(datosIncapacidad[0].endDate).format(
+    //         "DD/MM/YYYY"
+    //       )}</li>
+    //       <li>Cant. de Días: ${
+    //         dayjs(datosIncapacidad[0].endDate).diff(
+    //           dayjs(datosIncapacidad[0].startDate),
+    //           "day"
+    //         ) + 1
+    //       }</li>
+    //       <li>Comentario: ${
+    //         datosIncapacidad[0].comment
+    //           ? datosIncapacidad[0].comment
+    //           : "Sin comentario"
+    //       }</li>
+    //     </ul>
+    //   `
+    // );
+    res.status(201).json({
+      // incapacityID: result.insertId,
+      message: "Incapacidad registrada correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al registrar la incapacidad" });
+  }
+};
+
+
+exports.addInreview = async (req, res) => {
+  // Ajustamos la desestructuración para que coincida con lo que envía tu formulario React
+  const {
+    employeeID,
+    startTime,
+    startDate,
+    endDate,
+    comment
+  } = req.body;
+
+  try {
+    const normalizeTime = (v) => {
+      if (!v) return dayjs().format("HH:mm:ss");
+      const s = String(v).trim();
+      const re = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+      if (!re.test(s)) return null;
+      return s.length === 5 ? `${s}:00` : s;
+    };
+
+    const startTimeDB = normalizeTime(startTime);
+    if (!startTimeDB) {
+      return res.status(400).json({
+        success: false,
+        message: "Hora inválida. Usa formato HH:mm o HH:mm:ss.",
+      });
+    }
+    const formattedStartDate = dayjs(startDate).format("YYYY-MM-DD");
+    const formattedEndDate = dayjs(endDate).format("YYYY-MM-DD");
+
+
+    // VALIDACIÓN DE TRASLAPE/DUPLICIDAD
+
+    const [overlapping] = await db.query(
+      `SELECT inreviewID FROM inreview_emp 
+       WHERE employeeID = ? 
+         AND startDate <= ? 
+         AND endDate >= ?`,
+      [employeeID, formattedEndDate, formattedStartDate]
+    );
+
+    if (overlapping.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "El empleado ya tiene una revisión registrada que se traslapa con estas fechas.",
+      });
+    }
+
+
+    const [result] = await db.query(
+      `INSERT INTO inreview_emp (
+        employeeID, 
+        startDate, 
+        startTime, 
+        endDate, 
+        comment, 
+        createdDate, 
+        createdBy
+      )
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        employeeID,
+        dayjs(startDate).format("YYYY-MM-DD"),
+        startTimeDB,
+        dayjs(endDate).format("YYYY-MM-DD"),
+        comment || null,
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Revisión de empleado registrada correctamente",
+      insertId: result.insertId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Error al registrar la revisión"
+    });
+  }
+};
+
+exports.pendingPage = async (req, res) => {
+  try {
+    const { page = 1, limit = 50, q = "", from = "", to = "" } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    const like = `%${q}%`;
+
+    const dateFilter = from && to ?
+      "AND NOT (DATE(r.endDate) < DATE(?) OR DATE(r.startDate) > DATE(?))" : "";
+
+    const sql = `
+      SELECT
+        r.inreviewID,
+        r.employeeID,
+        e.codeEmployee,
+        CONCAT(
+          COALESCE(e.firstName, ''), ' ',
+          COALESCE(e.middleName, ''), ' ',
+          COALESCE(e.lastName, '')
+        ) AS employeeName,
+        r.startDate,
+        r.startTime,
+        r.endDate,
+        r.comment,
+        r.createdDate,
+        r.createdBy
+      FROM inreview_emp AS r
+      LEFT JOIN employees_emp AS e ON e.employeeID = r.employeeID
+      WHERE (? = ''
+        OR e.firstName LIKE ?
+        OR e.lastName LIKE ?
+        OR e.codeEmployee LIKE ?
+        OR r.comment LIKE ?
+      )
+      ${dateFilter}
+      ORDER BY CAST(e.codeEmployee AS UNSIGNED) ASC, r.createdDate DESC
+      LIMIT ? OFFSET ?;
+    `;
+
+    const params = [
+      q,
+      like,
+      like,
+      like,
+      like,
+      ...(from && to ? [from, to] : []),
+      Number(limit),
+      Number(offset),
+    ];
+
+    const [rows] = await db.query(sql, params);
+
+    const countSql = `
+      SELECT COUNT(*) AS total
+      FROM inreview_emp AS r
+      LEFT JOIN employees_emp AS e ON e.employeeID = r.employeeID
+      WHERE (? = ''
+        OR e.firstName LIKE ?
+        OR e.lastName LIKE ?
+        OR e.codeEmployee LIKE ?
+        OR r.comment LIKE ?
+      )
+      ${dateFilter};
+    `;
+
+    const [[{ total }]] = await db.query(countSql, [
+      q,
+      like,
+      like,
+      like,
+      like,
+      ...(from && to ? [from, to] : []),
+    ]);
+
+    return res.json({
+      success: true,
+      data: rows,
+      page: Number(page),
+      limit: Number(limit),
+      total,
+    });
+  } catch (error) {
+    console.error("pendingPage error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error obteniendo revisiones pendientes",
+    });
+  }
+};
+
+exports.updatePending = async (req, res) => {
+  try {
+    const { id } = req.params; // inreviewID
+    const { startDate, startTime, endDate, comment } = req.body;
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "Falta ID de la revisión.",
+      });
+    }
+
+    const normalizeTime = (v) => {
+      if (!v) return null;
+      const s = String(v).trim();
+      const re = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+      if (!re.test(s)) return null;
+      return s.length === 5 ? `${s}:00` : s;
+    };
+
+    // Validación de rango de fechas si vienen ambas
+    if (startDate && endDate && dayjs(startDate).isAfter(dayjs(endDate))) {
+      return res.status(400).json({
+        success: false,
+        message: "La fecha de inicio no puede ser mayor que la de fin.",
+      });
+    }
+
+    // Construye la consulta SET dinámicamente
+    const fields = [];
+    const vals = [];
+
+    if (startDate) {
+      fields.push("startDate=?");
+      vals.push(dayjs(startDate).format("YYYY-MM-DD"));
+    }
+    if (startTime) {
+      const normalizedTime = normalizeTime(startTime);
+      if (!normalizedTime) {
+        return res.status(400).json({
+          success: false,
+          message: "Hora inválida. Usa formato HH:mm o HH:mm:ss.",
+        });
+      }
+      fields.push("startTime=?");
+      vals.push(normalizedTime);
+    }
+    if (endDate) {
+      fields.push("endDate=?");
+      vals.push(dayjs(endDate).format("YYYY-MM-DD"));
+    }
+    if (comment !== undefined) {
+      fields.push("comment=?");
+      vals.push(comment);
+    }
+
+    // Si no hay campos para actualizar, no hagas nada
+    if (fields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No hay campos para actualizar.",
+      });
+    }
+
+    vals.push(id);
+
+    const sql = `UPDATE inreview_emp SET ${fields.join(", ")} WHERE inreviewID = ?`;
+    const [result] = await db.query(sql, vals);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Revisión no encontrada.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Revisión actualizada correctamente.",
+    });
+  } catch (error) {
+    console.error("updatePending error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al actualizar la revisión.",
+    });
+  }
+};
+
+exports.exportPending = async (req, res) => {
+  try {
+    const { q = "", from = "", to = "" } = req.query;
+    const like = `%${q}%`;
+
+    const dateFilter = from && to ?
+      "AND NOT (DATE(r.endDate) < DATE(?) OR DATE(r.startDate) > DATE(?))" : "";
+
+    const sql = `
+      SELECT
+        r.inreviewID,
+        r.employeeID,
+        e.codeEmployee,
+        CONCAT(
+          COALESCE(e.firstName, ''), ' ',
+          COALESCE(e.middleName, ''), ' ',
+          COALESCE(e.lastName, '')
+        ) AS employeeName,
+        r.startDate,
+        r.startTime,
+        r.endDate,
+        r.comment,
+        r.createdDate,
+        r.createdBy
+      FROM inreview_emp AS r
+      LEFT JOIN employees_emp AS e ON e.employeeID = r.employeeID
+      WHERE (? = ''
+        OR e.firstName LIKE ?
+        OR e.lastName LIKE ?
+        OR e.codeEmployee LIKE ?
+        OR r.comment LIKE ?
+      )
+      ${dateFilter}
+    ORDER BY CAST(e.codeEmployee AS UNSIGNED) ASC;
+    `;
+
+    const params = [
+      q,
+      like,
+      like,
+      like,
+      like,
+      ...(from && to ? [from, to] : []),
+    ];
+
+    const [rows] = await db.query(sql, params);
+
+    // Crear workbook de Excel
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Revisiones Pendientes");
+
+    // Definir columnas
+    worksheet.columns = [
+      // { header: "ID Revisión", key: "inreviewID", width: 12 },
+      { header: "Código Empleado", key: "codeEmployee", width: 15 },
+      { header: "Nombre Empleado", key: "employeeName", width: 30 },
+      { header: "Fecha Inicio", key: "startDate", width: 15 },
+      { header: "Hora Inicio", key: "startTime", width: 12 },
+      { header: "Fecha Fin", key: "endDate", width: 15 },
+      { header: "Comentario", key: "comment", width: 40 },
+      { header: "Fecha Creación", key: "createdDate", width: 18 },
+      { header: "Creado Por", key: "createdBy", width: 12 },
+    ];
+
+    // Formatear datos y agregar filas
+    rows.forEach((row) => {
+      worksheet.addRow({
+        inreviewID: row.inreviewID,
+        codeEmployee: row.codeEmployee || "",
+        employeeName: row.employeeName || "",
+        startDate: row.startDate ? dayjs(row.startDate).format("DD/MM/YYYY") : "",
+        startTime: row.startTime || "",
+        endDate: row.endDate ? dayjs(row.endDate).format("DD/MM/YYYY") : "",
+        comment: row.comment || "",
+        createdDate: row.createdDate ? dayjs(row.createdDate).format("DD/MM/YYYY HH:mm") : "",
+        createdBy: row.createdBy || "",
+      });
+    });
+
+    // Estilos del header
+    const headerRow = worksheet.getRow(1);
+    headerRow.font = { bold: true };
+    headerRow.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFE6E6FA" },
+    };
+
+    // Configurar respuesta
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=revisiones_pendientes_${dayjs().format("YYYY-MM-DD")}.xlsx`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("exportPending error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al exportar revisiones pendientes",
+    });
+  }
+};
+
+
+
+
+// Obtener tipos de incapacidad para el formulario
+exports.getDisabilityTypes = async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT disabilityTypeID, disabilityName FROM disabilitytype_emp ORDER BY disabilityName ASC"
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error("Error al cargar tipos de incapacidad:", err);
+    res.status(500).json({ success: false, message: "Error al cargar tipos" });
+  }
+};
+
+// Actualizar 4 campos editables de una incapacidad
+exports.updateDisability = async (req, res) => {
+  try {
+    const { id } = req.params; // disabilityID
+    const { disabilityTypeID, weekPaid, startDate, endDate, comment } = req.body;
+
+    if (!id) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Falta ID de la incapacidad." });
+    }
+
+    // Validación de rango de fechas si vienen ambas
+    if (startDate && endDate && dayjs(startDate).isAfter(dayjs(endDate))) {
+      return res.status(400).json({
+        success: false,
+        message: "La fecha de inicio no puede ser mayor que la de fin.",
+      });
+    }
+
+    // Construye la consulta SET dinámicamente
+    const fields = [];
+    const vals = [];
+
+    if (disabilityTypeID != null) {
+      fields.push("disabilityTypeID=?");
+      vals.push(Number(disabilityTypeID));
+    }
+    if (weekPaid != null) {
+      fields.push("weekPaid=?");
+      vals.push(Number(weekPaid));
+    }
+    if (startDate) {
+      fields.push("startDate=?");
+      vals.push(dayjs(startDate).format("YYYY-MM-DD"));
+    }
+    if (endDate) {
+      fields.push("endDate=?");
+      vals.push(dayjs(endDate).format("YYYY-MM-DD"));
+    }
+    // Permite actualizar el comentario a un string vacío, pero no si es undefined
+    if (comment !== undefined) {
+      fields.push("comment=?");
+      vals.push(comment);
+    }
+
+    // Si no hay campos para actualizar, no hagas nada.
+    if (fields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No hay campos válidos para actualizar.",
+      });
+    }
+
+    fields.push("updatedDate=NOW()");
+    fields.push("updatedBy=?");
+    vals.push(getUserIdFromToken(req) || null);
+
+    vals.push(id);
+
+    const [r] = await db.query(
+      `UPDATE disability_emp SET ${fields.join(", ")} WHERE disabilityID=?`,
+      vals
+    );
+
+    res.json({
+      success: r.affectedRows > 0,
+      message: r.affectedRows > 0 ? "Incapacidad actualizada." : "Sin cambios.",
+    });
+  } catch (err) {
+    console.error("Error en updateDisability:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Error al actualizar la incapacidad." });
+  }
+};
+
+// GET /dataForm/extDisability
+exports.getExtDisability = async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT extByID, name FROM extdisability_emp;`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("getExtDisability error:", err);
+    res.status(500).json({ message: "Error cargando Ext. By" });
+  }
+};
+
+
+//Endpoint para agregar maternidad
+//Agregar boton para limpiar calendario **pendiente 
+exports.addMaternity = async (req, res) => {
+  try {
+    const {
+      employeeID,
+      maternitytypeID,
+      startDate,
+      endDate,
+      comment,
+      documentation,
+    } = req.body;
+
+    if (!employeeID || !maternitytypeID || !startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Datos incompletos.",
+      });
+    }
+
+    if (
+      !dayjs(startDate).isValid() ||
+      !dayjs(endDate).isValid() ||
+      dayjs(startDate).isAfter(dayjs(endDate))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "La fecha de inicio no puede ser mayor que la de fin.",
+      });
+    }
+
+    const sd = dayjs(startDate).format("YYYY-MM-DD");
+    const ed = dayjs(endDate).format("YYYY-MM-DD");
+    const maternityType = Number(maternitytypeID);
+    const isPreMaternity = maternityType === 1;
+    const isPostMaternity = maternityType === 2;
+    const userId = getUserIdFromToken(req) || null;
+
+    // Evitar maternidades duplicadas o períodos incompatibles.
+    const overlapQuery = `
+      SELECT maternityID
+      FROM maternity_emp
+      WHERE employeeID = ?
+      AND maternitytypeID = ?
+        AND NOT (
+          DATE(endDate) < DATE(?)
+          OR DATE(startDate) > DATE(?)
+        ) `;
+        // ${
+        //   isPostMaternity
+        //     ? "AND NOT (maternitytypeID = 1 AND DATE(endDate) = DATE(?))"
+        //     : ""
+        // }
+        // ${
+        //   isPreMaternity
+        //     ? "AND NOT (maternitytypeID = 2 AND DATE(startDate) = DATE(?))"
+        //     : ""
+        // }
+
+    const overlapParams = [employeeID, maternitytypeID, sd, ed];
+
+    // if (isPostMaternity) {
+    //   overlapParams.push(sd);
+    // } else if (isPreMaternity) {
+    //   overlapParams.push(ed);
+    // }
+
+    const [overlap] = await db.query(overlapQuery, overlapParams);
+
+    if (overlap.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Ya existe una maternidad registrada para las fechas seleccionadas.",
+      });
+    }
+
+    // Registrar maternidad.
+    const [r] = await db.query(
+      `INSERT INTO maternity_emp
+        (
+          employeeID,
+          maternitytypeID,
+          startDate,
+          endDate,
+          comment,
+          documentation,
+          createDate,
+          createdBy
+        )
+       VALUES (?, ?, ?, ?, ?, ?, NOW(), ?)`,
+      [
+        employeeID,
+        maternityType,
+        sd,
+        ed,
+        comment || null,
+        documentation || 0,
+        userId,
+      ]
+    );
+
+    // PRENATAL: cerrar la excepción de embarazada un día antes del prenatal.
+    if (isPreMaternity) {
+      const pregnantEndDate = dayjs(sd)
+        .subtract(1, "day")
+        .format("YYYY-MM-DD");
+
+      const [pregnancyRows] = await db.query(
+        `SELECT exceptionID
+         FROM exceptions_emp
+         WHERE LOWER(exceptionName) LIKE '%embarazada%'
+         LIMIT 1`
+      );
+
+      if (pregnancyRows.length > 0) {
+        const pregnancyExceptionID = pregnancyRows[0].exceptionID;
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = ?,
+               updatedDate = NOW(),
+               updatedBy = ?
+           WHERE employeeID = ?
+             AND exceptionID = ?
+             AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+          [
+            pregnantEndDate,
+            userId,
+            employeeID,
+            pregnancyExceptionID,
+            pregnantEndDate,
+          ]
+        );
+      }
+    }
+
+    // POSTNATAL: crear o actualizar lactancia sin duplicarla.
+    if (isPostMaternity) {
+      // La lactancia inicia al día siguiente del fin del postnatal.
+      // Finaliza seis meses después del inicio del postnatal.
+      const lactationStartDate = dayjs(ed)
+        .add(1, "day")
+        .format("YYYY-MM-DD");
+
+      const lactationEndDate = dayjs(sd)
+        .add(6, "month")
+        .format("YYYY-MM-DD");
+
+      const noExceptionStartDate = dayjs(lactationEndDate)
+        .add(1, "day")
+        .format("YYYY-MM-DD");
+
+      const [lactationRows] = await db.query(
+        `SELECT exceptionID
+         FROM exceptions_emp
+         WHERE LOWER(exceptionName) LIKE '%lactancia%'
+         LIMIT 1`
+      );
+
+      const [noExceptionRows] = await db.query(
+        `SELECT exceptionID
+         FROM exceptions_emp
+         WHERE LOWER(exceptionName) LIKE '%sin excepciones%'
+         LIMIT 1`
+      );
+
+      if (lactationRows.length > 0) {
+        const lactationExceptionID = lactationRows[0].exceptionID;
+
+        // Buscar una excepción de lactancia existente que coincida
+        // con el período que corresponde al postnatal.
+        const [existingLactation] = await db.query(
+          `SELECT hassignmentexceptionID
+           FROM h_assigmentexception_emp
+           WHERE employeeID = ?
+             AND exceptionID = ?
+             AND DATE(startDate) <= DATE(?)
+             AND (
+               endDate IS NULL
+               OR DATE(endDate) >= DATE(?)
+             )
+           ORDER BY hassignmentexceptionID DESC
+           LIMIT 1`,
+          [
+            employeeID,
+            lactationExceptionID,
+            lactationEndDate,
+            lactationStartDate,
+          ]
+        );
+
+        let existingLactationID = null;
+
+        if (existingLactation.length > 0) {
+          // Ya existe una lactancia: conservar el registro y actualizarlo.
+          existingLactationID =
+            existingLactation[0].hassignmentexceptionID;
+
+          await db.query(
+            `UPDATE h_assigmentexception_emp
+             SET startDate = ?,
+                 endDate = ?,
+                 updatedDate = NOW(),
+                 updatedBy = ?
+             WHERE hassignmentexceptionID = ?`,
+            [
+              lactationStartDate,
+              lactationEndDate,
+              userId,
+              existingLactationID,
+            ]
+          );
+        } else {
+          // No existe una lactancia para ese período: crearla.
+          const [insertLactation] = await db.query(
+            `INSERT INTO h_assigmentexception_emp
+              (
+                employeeID,
+                exceptionID,
+                startDate,
+                endDate,
+                createdDate,
+                createdBy
+              )
+             VALUES (?, ?, ?, ?, NOW(), ?)`,
+            [
+              employeeID,
+              lactationExceptionID,
+              lactationStartDate,
+              lactationEndDate,
+              userId,
+            ]
+          );
+
+          existingLactationID = insertLactation.insertId;
+        }
+
+        // Cerrar otros períodos de lactancia que se solapen con el período
+        // nuevo, sin modificar el registro que acabamos de conservar.
+        if (existingLactationID !== null) {
+          const closePreviousDate = dayjs(lactationStartDate)
+            .subtract(1, "day")
+            .format("YYYY-MM-DD");
+
+          await db.query(
+            `UPDATE h_assigmentexception_emp
+             SET endDate = ?,
+                 updatedDate = NOW(),
+                 updatedBy = ?
+             WHERE employeeID = ?
+               AND exceptionID = ?
+               AND hassignmentexceptionID <> ?
+               AND (endDate IS NULL OR DATE(endDate) >= ?)
+               AND DATE(startDate) < DATE(?)`,
+            [
+              closePreviousDate,
+              userId,
+              employeeID,
+              lactationExceptionID,
+              existingLactationID,
+              closePreviousDate,
+              lactationStartDate,
+            ]
+          );
+        }
+      }
+
+      // Al iniciar lactancia, cerrar la excepción activa anterior el día
+      // anterior, sin cerrar la propia lactancia ni crear el solapamiento.
+      await db.query(
+        `UPDATE h_assigmentexception_emp
+         SET endDate = ?,
+             updatedDate = NOW(),
+             updatedBy = ?
+         WHERE employeeID = ?
+           AND exceptionID <> COALESCE(?, -1)
+             AND (endDate IS NULL OR DATE(endDate) >= DATE(?))
+           AND DATE(startDate) < ?`,
+        [
+          dayjs(lactationStartDate).subtract(1, "day").format("YYYY-MM-DD"),
+          userId,
+          employeeID,
+          lactationRows[0]?.exceptionID,
+          lactationStartDate,
+          lactationStartDate,
+        ]
+      );
+
+      // Registrar o actualizar "Sin excepciones" para evitar duplicados
+      // en la fecha de inicio calculada.
+      if (noExceptionRows.length === 0) {
+        throw new Error("No se encontró la excepción 'Sin excepciones'.");
+      }
+
+      const noExceptionID = noExceptionRows[0].exceptionID;
+
+      const [existingNoException] = await db.query(
+        `SELECT hassignmentexceptionID
+         FROM h_assigmentexception_emp
+         WHERE employeeID = ?
+           AND exceptionID = ?
+           AND DATE(startDate) = ?
+         ORDER BY hassignmentexceptionID DESC
+         LIMIT 1`,
+        [employeeID, noExceptionID, noExceptionStartDate]
+      );
+
+      if (existingNoException.length > 0) {
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = NULL,
+               updatedDate = NOW(),
+               updatedBy = ?
+           WHERE hassignmentexceptionID = ?`,
+          [
+            userId,
+            existingNoException[0].hassignmentexceptionID,
+          ]
+        );
+      } else {
+        await db.query(
+          `INSERT INTO h_assigmentexception_emp
+            (
+              employeeID,
+              exceptionID,
+              startDate,
+              endDate,
+              createdDate,
+              createdBy
+            )
+           VALUES (?, ?, ?, NULL, NOW(), ?)`,
+          [employeeID, noExceptionID, noExceptionStartDate, userId]
+        );
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: "Maternidad registrada y excepciones actualizadas.",
+      maternityID: r.insertId,
+    });
+  } catch (err) {
+    console.error("addMaternity error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Error al registrar la maternidad.",
+    });
+  }
+};
+
+
+//Endpoint para obtener la lista de maternidades
+// exports.maternityPage = async (req, res) => {
+//   try {
+//     const { page = 1, limit = 100, q = "" } = req.query;
+//     const offset = (Number(page) - 1) * Number(limit);
+//     const like = `%${q}%`;
+
+//     const [rows] = await db.query(
+//       `
+//       SELECT
+//         m.maternityID,
+//         m.employeeID,
+//         e.codeEmployee,
+//         CONCAT(e.firstName, ' ', COALESCE(e.middleName,''), ' ', e.lastName) AS employeeName,
+//         m.maternitytypeID,
+//         mt.maternityType AS maternityTypeName,
+//         m.startDate, m.endDate, m.comment,
+//         m.createDate AS createdDate
+//       FROM maternity_emp m
+//       INNER JOIN employees_emp e ON e.employeeID = m.employeeID
+//       LEFT JOIN maternitytype_emp mt ON mt.maternitytypeID = m.maternitytypeID
+//       WHERE e.codeEmployee LIKE ? OR e.firstName LIKE ? OR e.lastName LIKE ? 
+//       ORDER BY m.maternityID DESC
+//       LIMIT ? OFFSET ?;
+//       `,
+//       [like, like, like, Number(limit), Number(offset)]
+//     );
+
+//     res.json({ success: true, data: rows });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ success: false, message: "Error al cargar maternidades" });
+//   }
+// };
+
+exports.maternityPage = async (req, res) => {
+  try {
+    const { page = 1, limit = 100, q = "", from = "", to = "" } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    const like = `%${q}%`;
+
+    const hasRange = !!(from && to);
+
+    const whereSearch = `
+      (? = ''
+        OR e.codeEmployee LIKE ?
+        OR e.firstName LIKE ?
+        OR e.lastName LIKE ?
+        OR mt.maternityType LIKE ?
+        OR m.comment LIKE ?
+      )
+    `;
+
+    const whereRange = hasRange
+      ? `AND NOT (DATE(m.endDate) < DATE(?) OR DATE(m.startDate) > DATE(?))`
+      : ``;
+
+    const sql = `
+      SELECT
+        m.maternityID,
+        m.employeeID,
+        '-' weekPaid,
+        e.codeEmployee,
+        CONCAT(
+          COALESCE(e.firstName,''), ' ',
+          COALESCE(e.middleName,''), ' ',
+          COALESCE(e.lastName,'')
+        ) AS employeeName,
+        m.maternitytypeID,
+        mt.maternityType AS maternityTypeName,
+        '' startTime,
+        m.startDate,
+        m.endDate,
+        m.comment,
+        m.documentation,
+        m.createDate AS createdDate
+      FROM maternity_emp m
+      INNER JOIN employees_emp e ON e.employeeID = m.employeeID
+      LEFT JOIN maternitytype_emp mt ON mt.maternitytypeID = m.maternitytypeID
+      WHERE ${whereSearch}
+      ${whereRange}
+      ORDER BY m.maternityID DESC
+      LIMIT ? OFFSET ?;
+    `;
+
+    const params = [
+      q, like, like, like, like, like,
+      ...(hasRange ? [from, to] : []),
+      Number(limit), Number(offset),
+    ];
+
+    const [rows] = await db.query(sql, params);
+
+    // (Opcional pero recomendado) total para paginación real
+    const countSql = `
+      SELECT COUNT(*) AS total
+      FROM maternity_emp m
+      INNER JOIN employees_emp e ON e.employeeID = m.employeeID
+      LEFT JOIN maternitytype_emp mt ON mt.maternitytypeID = m.maternitytypeID
+      WHERE ${whereSearch}
+      ${whereRange};
+    `;
+
+    const countParams = [
+      q, like, like, like, like, like,
+      ...(hasRange ? [from, to] : []),
+    ];
+
+    const [[{ total }]] = await db.query(countSql, countParams);
+
+    return res.json({
+      success: true,
+      data: rows,
+      page: Number(page),
+      limit: Number(limit),
+      total,
+    });
+  } catch (err) {
+    console.error("maternityPage error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Error al cargar maternidades",
+    });
+  }
+};
+
+//Endpoint para obtener los tipos de maternidad
+exports.maternityTypes = async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT maternitytypeID, maternityType AS maternityTypeName
+       FROM maternitytype_emp
+       ORDER BY maternitytypeID;`
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error al cargar tipos de maternidad" });
+  }
+};
+
+//Endpoint para actualizar una maternidad
+exports.updateMaternity = async (req, res) => {
+  try {
+    const { id } = req.params; // maternityID
+    const { maternitytypeID, startDate, endDate, comment } = req.body;
+
+    if (!maternitytypeID || !startDate || !endDate) {
+      return res.status(400).json({ success: false, message: "Datos incompletos." });
+    }
+
+    const sd = dayjs(startDate).format('YYYY-MM-DD');
+    const ed = dayjs(endDate).format('YYYY-MM-DD');
+
+    if (dayjs(sd).isAfter(dayjs(ed))) {
+      return res
+        .status(400)
+        .json({ success: false, message: "La fecha de inicio no puede ser mayor que la de fin." });
+    }
+
+    // Obtener el registro actual de maternidad para saber el employeeID y tipo anterior si es necesario
+    const [existingMaternity] = await db.query(
+      `SELECT employeeID, maternitytypeID, startDate, endDate
+       FROM maternity_emp
+       WHERE maternityID = ?
+       LIMIT 1`,
+      [id]
+    );
+
+    if (!existingMaternity || existingMaternity.length === 0) {
+      return res.status(404).json({ success: false, message: "Registro de maternidad no encontrado." });
+    }
+
+    const employeeID = existingMaternity[0].employeeID;
+    const previousMaternityType = Number(existingMaternity[0].maternitytypeID);
+    const previousStartDate = dayjs(existingMaternity[0].startDate).format("YYYY-MM-DD");
+    const previousEndDate = dayjs(existingMaternity[0].endDate).format("YYYY-MM-DD");
+    const maternityType = Number(maternitytypeID);
+    const isPreMaternity = maternityType === 1;
+    const isPostMaternity = maternityType === 2;
+    const wasPreMaternity = previousMaternityType === 1;
+    const wasPostMaternity = previousMaternityType === 2;
+    const userId = getUserIdFromToken(req) || null;
+
+    //  Actualizar la tabla maternity_emp
+    await db.query(
+      `UPDATE maternity_emp
+       SET maternitytypeID = ?, startDate = ?, endDate = ?, comment = ?, updatedDate = NOW(), updatedBy = ?
+       WHERE maternityID = ?`,
+      [maternitytypeID, sd, ed, comment || null, userId, id]
+    );
+
+    const [pregnancyExceptions] = await db.query(
+      `SELECT exceptionID
+       FROM exceptions_emp
+       WHERE LOWER(exceptionName) LIKE '%embarazada%'
+       LIMIT 1`
+    );
+    const [lactationExceptions] = await db.query(
+      `SELECT exceptionID
+       FROM exceptions_emp
+       WHERE LOWER(exceptionName) LIKE '%lactancia%'
+       LIMIT 1`
+    );
+    const [noExceptionRows] = await db.query(
+      `SELECT exceptionID
+       FROM exceptions_emp
+       WHERE LOWER(exceptionName) LIKE '%sin excepciones%'
+       LIMIT 1`
+    );
+
+    if (pregnancyExceptions.length > 0) {
+      const pregnancyExceptionID = pregnancyExceptions[0].exceptionID;
+      const previousPregnancyEndDate = dayjs(previousStartDate)
+        .subtract(1, "day")
+        .format("YYYY-MM-DD");
+
+      if (wasPreMaternity) {
+        if (isPreMaternity) {
+          const [updated] = await db.query(
+            `UPDATE h_assigmentexception_emp
+             SET endDate = ?, updatedDate = NOW(), updatedBy = ?
+             WHERE employeeID = ? AND exceptionID = ? AND DATE(endDate) = ?`,
+            [dayjs(sd).subtract(1, "day").format("YYYY-MM-DD"), userId, employeeID, pregnancyExceptionID, previousPregnancyEndDate]
+          );
+
+          if (updated.affectedRows === 0) {
+            await db.query(
+              `UPDATE h_assigmentexception_emp
+               SET endDate = ?, updatedDate = NOW(), updatedBy = ?
+               WHERE employeeID = ? AND exceptionID = ?
+                 AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+              [dayjs(sd).subtract(1, "day").format("YYYY-MM-DD"), userId, employeeID, pregnancyExceptionID, dayjs(sd).subtract(1, "day").format("YYYY-MM-DD")]
+            );
+          }
+        } else {
+          await db.query(
+            `UPDATE h_assigmentexception_emp
+             SET endDate = NULL, updatedDate = NOW(), updatedBy = ?
+             WHERE employeeID = ? AND exceptionID = ? AND DATE(endDate) = ?`,
+            [userId, employeeID, pregnancyExceptionID, previousPregnancyEndDate]
+          );
+        }
+      } else if (isPreMaternity) {
+        const pregnantEndDate = dayjs(sd).subtract(1, "day").format("YYYY-MM-DD");
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = ?, updatedDate = NOW(), updatedBy = ?
+           WHERE employeeID = ? AND exceptionID = ?
+             AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+          [pregnantEndDate, userId, employeeID, pregnancyExceptionID, pregnantEndDate]
+        );
+      }
+    }
+
+    if (lactationExceptions.length > 0) {
+      const lactationExceptionID = lactationExceptions[0].exceptionID;
+      const previousLactationStartDate = dayjs(previousEndDate).add(1, "day").format("YYYY-MM-DD");
+      const lactationStartDate = dayjs(ed).add(1, "day").format("YYYY-MM-DD");
+      const lactationEndDate = dayjs(sd).add(6, "month").format("YYYY-MM-DD");
+      const previousNoExceptionStartDate = dayjs(previousStartDate)
+        .add(6, "month")
+        .add(1, "day")
+        .format("YYYY-MM-DD");
+      const noExceptionStartDate = dayjs(lactationEndDate).add(1, "day").format("YYYY-MM-DD");
+
+      if (isPostMaternity) {
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = ?, updatedDate = NOW(), updatedBy = ?
+           WHERE employeeID = ?
+             AND exceptionID <> ?
+             AND (endDate IS NULL OR DATE(endDate) >= DATE(?))
+             AND DATE(startDate) < ?`,
+          [
+            dayjs(lactationStartDate).subtract(1, "day").format("YYYY-MM-DD"),
+            userId,
+            employeeID,
+            lactationExceptionID,
+            lactationStartDate,
+            lactationStartDate,
+          ]
+        );
+      }
+
+      if (wasPostMaternity) {
+        if (isPostMaternity) {
+        const [existingLactation] = await db.query(
+        `SELECT hassignmentexceptionID
+        FROM h_assigmentexception_emp
+        WHERE employeeID = ?
+          AND exceptionID = ?
+          AND DATE(startDate) <= DATE(?)
+          AND (
+            endDate IS NULL
+            OR DATE(endDate) >= DATE(?)
+          )
+        ORDER BY hassignmentexceptionID DESC
+        LIMIT 1`,
+        [
+          employeeID,
+          lactationExceptionID,
+          lactationEndDate,
+          lactationStartDate,
+        ]
+      );
+
+          if (existingLactation.length > 0) {
+            await db.query(
+              `UPDATE h_assigmentexception_emp
+               SET startDate = ?, endDate = ?, updatedDate = NOW(), updatedBy = ?
+               WHERE hassignmentexceptionID = ?`,
+              [lactationStartDate, lactationEndDate, userId, existingLactation[0].hassignmentexceptionID]
+            );
+          } else {
+            await db.query(
+              `INSERT INTO h_assigmentexception_emp
+               (employeeID, exceptionID, startDate, endDate, createdDate, createdBy)
+               VALUES (?, ?, ?, ?, NOW(), ?)`,
+              [employeeID, lactationExceptionID, lactationStartDate, lactationEndDate, userId]
+            );
+          }
+
+          if (noExceptionRows.length === 0) {
+            throw new Error("No se encontró la excepción 'Sin excepciones'.");
+          }
+
+          const noExceptionID = noExceptionRows[0].exceptionID;
+          const [existingNoException] = await db.query(
+            `SELECT hassignmentexceptionID
+             FROM h_assigmentexception_emp
+             WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?
+             ORDER BY hassignmentexceptionID DESC
+             LIMIT 1`,
+            [employeeID, noExceptionID, previousNoExceptionStartDate]
+          );
+
+          if (existingNoException.length > 0) {
+            await db.query(
+              `UPDATE h_assigmentexception_emp
+               SET startDate = ?, endDate = NULL, updatedDate = NOW(), updatedBy = ?
+               WHERE hassignmentexceptionID = ?`,
+              [noExceptionStartDate, userId, existingNoException[0].hassignmentexceptionID]
+            );
+          } else {
+            await db.query(
+              `INSERT INTO h_assigmentexception_emp
+               (employeeID, exceptionID, startDate, endDate, createdDate, createdBy)
+               VALUES (?, ?, ?, NULL, NOW(), ?)`,
+              [employeeID, noExceptionID, noExceptionStartDate, userId]
+            );
+          }
+        } else {
+          await db.query(
+            `DELETE FROM h_assigmentexception_emp
+             WHERE employeeID = ? AND exceptionID = ?
+               AND DATE(startDate) = ?`,
+            [employeeID, lactationExceptionID, previousLactationStartDate]
+          );
+
+          if (noExceptionRows.length > 0) {
+            await db.query(
+              `DELETE FROM h_assigmentexception_emp
+               WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?`,
+              [employeeID, noExceptionRows[0].exceptionID, previousNoExceptionStartDate]
+            );
+          }
+        }
+      } else if (isPostMaternity) {
+        const closePreviousDate = dayjs(lactationStartDate).subtract(1, "day").format("YYYY-MM-DD");
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = ?, updatedDate = NOW(), updatedBy = ?
+           WHERE employeeID = ? AND exceptionID = ?
+             AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+          [closePreviousDate, userId, employeeID, lactationExceptionID, closePreviousDate]
+        );
+        await db.query(
+          `INSERT INTO h_assigmentexception_emp
+           (employeeID, exceptionID, startDate, endDate, createdDate, createdBy)
+           VALUES (?, ?, ?, ?, NOW(), ?)`,
+          [employeeID, lactationExceptionID, lactationStartDate, lactationEndDate, userId]
+        );
+
+        if (noExceptionRows.length === 0) {
+           throw new Error("No se encontró la excepción 'Sin excepciones'.");
+        }
+
+        await db.query(
+           `INSERT INTO h_assigmentexception_emp
+            (employeeID, exceptionID, startDate, endDate, createdDate, createdBy)
+            VALUES (?, ?, ?, NULL, NOW(), ?)`,
+           [employeeID, noExceptionRows[0].exceptionID, noExceptionStartDate, userId]
+        );
+      }
+    }
+
+    return res.json({ success: true, message: "Maternidad y excepciones actualizadas correctamente." });
+  } catch (err) {
+    console.error("updateMaternity error:", err);
+    return res.status(500).json({ success: false, message: "Error al actualizar maternidad" });
+  }
+};
+
+exports.deletePendingById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ success: false, message: "id es requerido." });
+    }
+
+    const [r] = await db.query(
+      `DELETE FROM inreview_emp WHERE inreviewID = ?`,
+      [Number(id)]
+    );
+
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Incapacidad pendiente no encontrada." });
+    }
+
+
+    io.emit("inreview:deleted", { inreviewID: Number(id) });
+
+    return res.json({ success: true, message: "Incapacidad pendiente eliminada correctamente." });
+  } catch (err) {
+    console.error("deletePending error:", err);
+    return res.status(500).json({ success: false, message: "Error al eliminar la incapacidad pendiente." });
+  }
+};
+
+
+
+//Endpoint para eliminar una maternidad por ID
+exports.deleteMaternityById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, message: "id es requerido." });
+    }
+
+    // Consultar los datos de la maternidad antes de borrarla
+    const [existingMaternity] = await db.query(
+      `SELECT employeeID, maternitytypeID, startDate, endDate FROM maternity_emp WHERE maternityID = ? LIMIT 1`,
+      [Number(id)]
+    );
+
+    if (!existingMaternity || existingMaternity.length === 0) {
+      return res.status(404).json({ success: false, message: "Maternidad no encontrada." });
+    }
+
+    const { employeeID, maternitytypeID, startDate, endDate } = existingMaternity[0];
+    const maternityType = Number(maternitytypeID);
+    const isPreMaternity = maternityType === 1;
+    const isPostMaternity = maternityType === 2;
+
+    // Eliminar el registro de maternidad
+    const [r] = await db.query(
+      `DELETE FROM maternity_emp WHERE maternityID = ?`,
+      [Number(id)]
+    );
+
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Maternidad no encontrada." });
+    }
+
+    // LIMPIEZA DE EXCEPCIONES AL ELIMINAR
+    if (isPreMaternity) {
+      // Si se borra el Prenatal, la excepción de embarazada ya no debe terminar un día antes del prenatal.
+      // Se limpia la fecha fin asignada por ese prenatal.
+      const pregnantEndDate = dayjs(startDate).subtract(1, "day").format("YYYY-MM-DD");
+
+      const [excRows] = await db.query(
+        `SELECT exceptionID FROM exceptions_emp WHERE LOWER(exceptionName) LIKE '%embarazada%' LIMIT 1`
+      );
+
+      if (excRows.length > 0) {
+        const exceptionID = excRows[0].exceptionID;
+
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = NULL, updatedDate = NOW(), updatedBy = ?
+           WHERE employeeID = ? AND exceptionID = ? AND DATE(endDate) = ?`,
+          [getUserIdFromToken(req) || null, employeeID, exceptionID, pregnantEndDate]
+        );
+      }
+    } else if (isPostMaternity) {
+      // Si se borra el Postnatal, eliminamos la excepción de lactancia generada
+      const lactationStartDate = dayjs(endDate).add(1, "day").format("YYYY-MM-DD");
+      const previousExceptionEndDate = dayjs(lactationStartDate)
+        .subtract(1, "day")
+        .format("YYYY-MM-DD");
+      const noExceptionStartDate = dayjs(startDate).add(6, "month").add(1, "day").format("YYYY-MM-DD");
+
+      const [excRows] = await db.query(
+        `SELECT exceptionID FROM exceptions_emp WHERE LOWER(exceptionName) LIKE '%lactancia%' LIMIT 1`
+      );
+
+      if (excRows.length > 0) {
+        const exceptionID = excRows[0].exceptionID;
+
+        await db.query(
+          `DELETE FROM h_assigmentexception_emp
+           WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?`,
+          [employeeID, exceptionID, lactationStartDate]
+        );
+
+        await db.query(
+          `UPDATE h_assigmentexception_emp
+           SET endDate = NULL,
+               updatedDate = NOW(),
+               updatedBy = ?
+           WHERE employeeID = ?
+             AND exceptionID <> ?
+             AND DATE(startDate) < ?
+             AND DATE(endDate) = ?`,
+          [
+            getUserIdFromToken(req) || null,
+            employeeID,
+            exceptionID,
+            lactationStartDate,
+            previousExceptionEndDate,
+          ]
+        );
+      }
+
+      const [noExceptionRows] = await db.query(
+        `SELECT exceptionID FROM exceptions_emp WHERE LOWER(exceptionName) LIKE '%sin excepciones%' LIMIT 1`
+      );
+
+      if (noExceptionRows.length > 0) {
+        await db.query(
+          `DELETE FROM h_assigmentexception_emp
+           WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?`,
+          [employeeID, noExceptionRows[0].exceptionID, noExceptionStartDate]
+        );
+      }
+    }
+
+    io.emit("maternity:deleted", { maternityID: Number(id) });
+
+    return res.json({ success: true, message: "Maternidad y sus excepciones asociadas eliminadas correctamente." });
+  } catch (err) {
+    console.error("deleteMaternityById error:", err);
+    return res.status(500).json({ success: false, message: "Error al eliminar maternidad" });
+  }
+};
+
+// Endpoint para eliminar una incapacidad por ID
+exports.deleteDisabilityById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ success: false, message: "id es requerido." });
+    }
+
+    const [r] = await db.query(
+      `DELETE FROM disability_emp WHERE disabilityID = ?`,
+      [Number(id)]
+    );
+
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Incapacidad no encontrada." });
+    }
+
+
+    io.emit("disability:deleted", { disabilityID: Number(id) });
+
+    return res.json({ success: true, message: "Incapacidad eliminada correctamente." });
+  } catch (err) {
+    console.error("deleteDisabilityById error:", err);
+    return res.status(500).json({ success: false, message: "Error al eliminar la incapacidad." });
+  }
+};
+
+// Endpoint para crear un permiso colectivo (permisos masivos para un grupo de empleados)
+exports.createGroupPermissions = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { date, comment, paid, employeesSelected } = req.body;
+
+    if (!date || !comment || !Array.isArray(employeesSelected) || employeesSelected.length === 0) {
+      return res.status(400).json({ success: false, message: t('requiredFields') });
+    }
+
+    const insertValues = employeesSelected.map(async empID => {
+      await db.query(
+        `INSERT INTO permissionattendance_emp 
+        (permissionTypeID, employeeID, date, line, 
+        exitTimePermission, entryTimePermission, exitPermission, entryPermission,
+        comment, coveredTime, lunchTime, request, isPaid, isApproved, approvedBy,
+        status, createdDate, createdBy) 
+         VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          idPermissionCollective,
+          empID.employeeID,
+          dayjs(date).format('YYYY-MM-DD'),
+          null,
+          empID.startTime || empID.startTime,
+          empID.entryTime || empID.endTime,
+          empID.startTime || empID.startTime,
+          empID.entryTime || empID.endTime,
+          comment,
+          0,
+          0,
+          0,
+          paid,
+          1,
+          3,
+          0,
+          camposAuditoriaADD(req)
+        ]
+      );
+    }
+    )
+    await Promise.all(insertValues);
+    return res.json({ success: true, message: t('saveSuccess') });
+  }
+  catch (err) {
+    console.error("createGroupPermissions error:", err);
+    return res.status(500).json({ success: false, message: t('saveError') });
+  }
+};
+
+// exports.createGroupDeferredPermissions = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//     const { date, comment, paid, employeesSelected } = req.body;
+
+//     if (!date || !comment || !Array.isArray(employeesSelected) || employeesSelected.length === 0) {
+//       return res.status(400).json({ success: false, message: t('requiredFields') });
+//     }
+
+//     const insertValues = employeesSelected.map(async (emp) => {
+//       const start = emp.startTime || "07:00:00";     // comienzo turno
+//       const entry = emp.entryTime || "07:00:00";     // hora real (tardía)
+
+//       await db.query(
+//         `INSERT INTO permissionattendance_emp 
+//         (permissionTypeID, employeeID, date, line,
+//          exitTimePermission, entryTimePermission, exitPermission, entryPermission,
+//          comment, coveredTime, lunchTime, request, isPaid, isApproved, approvedBy,
+//          status, createdDate, createdBy)
+//          VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )`,
+//         [
+//           idPermissionCollective,
+//           emp.employeeID,
+//           dayjs(date).format('YYYY-MM-DD'),
+//           null,
+//           start,
+//           entry,
+//           start,
+//           entry,
+//           comment,
+//           0,
+//           0,
+//           0,        
+//           paid,
+//           1,
+//           3,
+//           0,
+//           ...camposAuditoriaADD(req),
+//         ]
+//       );
+//     });
+
+//     await Promise.all(insertValues);
+
+//     return res.json({ success: true, message: t('saveSuccess') });
+//   } catch (err) {
+//     console.error("createGroupDeferredPermissions error:", err);
+//     return res.status(500).json({ success: false, message: t('saveError') });
+//   }
+// };
+
+
+exports.createGroupDeferredPermissions = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const {
+      date,
+      comment,
+      employeesSelected,
+      permissionTypeID,
+      isPaid,
+      lunchTime,
+    } = req.body;
+
+
+    if (
+      !date ||
+      !comment ||
+      !permissionTypeID ||
+      !Array.isArray(employeesSelected) ||
+      employeesSelected.length === 0
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: t("requiredFields", language) });
+    }
+
+    const pType = Number(permissionTypeID);
+    if (!pType || Number.isNaN(pType)) {
+      return res
+        .status(400)
+        .json({ success: false, message: t("requiredFields", language) });
+    }
+
+
+    const paid = isPaid ? 1 : 0;
+    const lunch = lunchTime ? 1 : 0;
+
+    let inserted = 0;
+    let skipped = 0;
+
+    const tasks = employeesSelected.map(async (emp) => {
+      const start = emp.startTime; // HH:mm:ss
+      const entry = emp.entryTime; // HH:mm:ss
+      const employeeID = emp.employeeID;
+
+      if (!employeeID || !start || !entry) {
+        skipped++;
+        return;
+      }
+
+      try {
+        await db.query(
+          `INSERT INTO permissionattendance_emp 
+            (
+              permissionTypeID, employeeID, date, line,
+              exitTimePermission, entryTimePermission, exitPermission, entryPermission,
+              comment, coveredTime, lunchTime, request, isPaid, isApproved, approvedBy,
+              status, createdDate, createdBy
+            )
+           VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )`,
+          [
+            pType,
+            employeeID,
+            dayjs(date).format("YYYY-MM-DD"),
+            null,
+
+            start, // exitTimePermission
+            entry, // entryTimePermission
+            start, // exitPermission
+            entry, // entryPermission
+
+            comment.trim(),
+            0,      // coveredTime (NO lo usas)
+            lunch,  // lunchTime
+            0,      // request
+
+            paid,
+
+            1,      // isApproved (si tu flujo lo quiere así; si no, pon 0)
+            3,      // approvedBy (ajusta según tu lógica / usuario)
+            0,      // status
+
+            ...camposAuditoriaADD(req),
+          ]
+        );
+
+        inserted++;
+      } catch (e) {
+        console.error("Insert deferred permission error:", e);
+        skipped++;
+      }
+    });
+
+    await Promise.all(tasks);
+
+    if (inserted > 0 && skipped === 0) {
+      return res.json({
+        success: true,
+        message: t("saveSuccess", language),
+      });
+    }
+
+    if (inserted > 0 && skipped > 0) {
+      return res.json({
+        success: true,
+        message:
+          t("saveSuccess", language) + ` (${inserted} OK, ${skipped} omitidos)`,
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: t("requiredFields", language),
+    });
+  } catch (err) {
+    console.error("createGroupDeferredPermissions error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: t("saveError", language) });
+  }
+};
+
+// Exportar juntas Incapacidades y Maternidades a Excel
+exports.exportDisabilityandMaternityToExcel = async (req, res) => {
+  const language = (req.headers["accept-language"] || "es").toLowerCase();
+  const { from, to } = req.query;
+  const COLL = "utf8mb4_general_ci";
+  const C = (expr) => `CONVERT(${expr} USING utf8mb4) COLLATE ${COLL}`;
+  try {
+    const kind = (req.query.kind || "ALL").toUpperCase(); // ALL | DIS | MAT
+    const q = (req.query.q || "").trim();
+    const qLike = `%${q}%`;
+    const hasRange = !!(from && to);
+    const weekFrom = hasRange ? dayjs(from).isoWeek() : null;
+    const weekTo = hasRange ? dayjs(to).isoWeek() : null;
+    const isWrappedWeekRange = hasRange ? weekFrom > weekTo : false;
+
+    // ======================
+    // SQL INCAPACIDADES
+    // ======================
+    const disabilitySQL = `
+  SELECT
+    ${C("'DIS'")} AS tipo,
+    e.codeEmployee AS codigo,
+    ${C(`CONCAT(
+      COALESCE(e.firstName,''),' ',
+      COALESCE(e.middleName,''),' ',
+      COALESCE(e.lastName,''),' ',
+      COALESCE(e.secondLastName,'')
+    )`)} AS empleado,
+    ${C("COALESCE(d.weekPaid,'-')")} AS weekPaid,
+    ${C("dt.disabilityName")} AS tipoRegistro,
+    ${C("COALESCE(ex.name,'-')")} AS extPor,
+    startTime AS horaInicio,
+    DATE(d.startDate) AS inicio,
+    DATE(d.endDate) AS fin,
+    (DATEDIFF(d.endDate, d.startDate) + 1) AS dias,
+    ${C("COALESCE(d.comment,'')")} AS comentario,
+    d.createdDate AS fechaCreacion
+  FROM disability_emp d
+  INNER JOIN disabilitytype_emp dt
+    ON dt.disabilityTypeID = d.disabilityTypeID
+  LEFT JOIN extdisability_emp ex
+    ON ex.extByID = d.extByID
+  INNER JOIN employees_emp e
+    ON e.employeeID = d.employeeID
+  WHERE 1=1 AND d.documentation = 1
+  ${q
+        ? `AND (
+        e.codeEmployee LIKE ? OR
+        CONCAT(
+          COALESCE(e.firstName,''),' ',
+          COALESCE(e.middleName,''),' ',
+          COALESCE(e.lastName,''),' ',
+          COALESCE(e.secondLastName,'')
+        ) LIKE ?
+      )`
+        : ``
+      }
+  ${hasRange
+        ? `AND (
+            NOT (DATE(d.endDate) < DATE(?) OR DATE(d.startDate) > DATE(?))
+            OR ${isWrappedWeekRange
+          ? `(d.weekPaid >= ? OR d.weekPaid <= ?)`
+          : `d.weekPaid BETWEEN ? AND ?`
+        }
+          )`
+        : ``
+      }
+`;
+
+    // ======================
+    // SQL MATERNIDAD
+    // ======================
+    const maternitySQL = `
+  SELECT
+    ${C("'MAT'")} AS tipo,
+   e.codeEmployee AS codigo,
+    ${C(`CONCAT(
+      COALESCE(e.firstName,''),' ',
+      COALESCE(e.middleName,''),' ',
+      COALESCE(e.lastName,''),' ',
+      COALESCE(e.secondLastName,'')
+    )`)} AS empleado,
+    '-' AS weekPaid,
+    ${C("mt.maternityType")} AS tipoRegistro,
+    ${C("'-'")} AS extPor,
+    '' AS horaInicio,
+    DATE(m.startDate) AS inicio,
+    DATE(m.endDate) AS fin,
+    (DATEDIFF(m.endDate, m.startDate) + 1) AS dias,
+    ${C("COALESCE(m.comment,'')")} AS comentario,
+    m.createDate AS fechaCreacion
+  FROM maternity_emp m
+  INNER JOIN maternitytype_emp mt
+    ON mt.maternitytypeID = m.maternitytypeID
+  INNER JOIN employees_emp e
+    ON e.employeeID = m.employeeID
+  WHERE 1=1 AND m.documentation = 1
+  ${q
+        ? `AND (
+        e.codeEmployee LIKE ? OR
+        CONCAT(
+          COALESCE(e.firstName,''),' ',
+          COALESCE(e.middleName,''),' ',
+          COALESCE(e.lastName,''),' ',
+          COALESCE(e.secondLastName,'')
+        ) LIKE ?
+      )`
+        : ``
+      }
+  ${hasRange
+        ? `AND NOT (DATE(m.endDate) < DATE(?) OR DATE(m.startDate) > DATE(?))`
+        : ``
+      }
+`;
+    let rows = [];
+    let params = [];
+    const disParams = [
+      ...(q ? [qLike, qLike] : []),
+      ...(hasRange ? [from, to, weekFrom, weekTo] : []),
+    ];
+    const matParams = [
+      ...(q ? [qLike, qLike] : []),
+      ...(hasRange ? [from, to] : []),
+    ];
+
+    if (kind === "DIS") {
+      params = disParams;
+      const [r] = await db.query(disabilitySQL, params);
+      rows = r;
+    } else if (kind === "MAT") {
+      params = matParams;
+      const [r] = await db.query(maternitySQL, params);
+      rows = r;
+    } else {
+      const unionSQL = `
+        (${disabilitySQL})
+        UNION ALL
+        (${maternitySQL})
+        ORDER BY fechaCreacion DESC
+        `;
+      params = [...disParams, ...matParams];
+      const [r] = await db.query(unionSQL, params);
+      rows = r;
+    }
+
+    // ======================
+    // EXCEL
+    // ======================
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Incapacidades y Maternidad");
+
+    worksheet.columns = [
+      { header: "Tipo", key: "tipo", width: 12 },
+      { header: "Código", key: "codigo", width: 12 },
+      { header: "Empleado", key: "empleado", width: 35 },
+      { header: "Semana Pagada", key: "weekPaid", width: 15 },
+      { header: "Tipo Incapacidad / Maternidad", key: "tipoRegistro", width: 30 },
+      { header: "Ext. Por", key: "extPor", width: 20 },
+      { header: "Hora Inicio", key: "horaInicio", width: 14 },
+      { header: "Comienzo", key: "inicio", width: 14 },
+      { header: "Finalización", key: "fin", width: 14 },
+      { header: "Días", key: "dias", width: 10 },
+      { header: "Comentario", key: "comentario", width: 35 },
+      { header: "Fecha de Creación", key: "fechaCreacion", width: 20 },
+    ];
+
+    // Header style
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getColumn("codigo").numFmt = "0";
+
+    rows.forEach((r) => {
+      worksheet.addRow({
+        ...r,
+        codigo: Number(r.codigo),
+        inicio: r.inicio ? dayjs(r.inicio).format("YYYY-MM-DD") : "-",
+        fin: r.fin ? dayjs(r.fin).format("YYYY-MM-DD") : "-",
+        horaInicio: r.horaInicio ? dayjs(r.horaInicio, "HH:mm:ss").format("hh:mm A") : "-",
+        fechaCreacion: r.fechaCreacion
+          ? dayjs(r.fechaCreacion).format("YYYY-MM-DD hh:mm A")
+          : "-",
+      });
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=disability_maternity_${kind}_${dayjs().format(
+        "YYYYMMDD_HHmm"
+      )}.xlsx`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Export disability/maternity error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error al exportar reporte",
+    });
+  }
+};
+
+// Endpoint para depurar y actulizar permisos 
+exports.cleanAndUpdatePermissions = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const { startDate, endDate } = req.body.params;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ success: false, message: t('requiredFields') });
+    }
+
+    // Obetener los dias que hay entre las fechas (excluir día de hoy)
+    const days = [];
+    let current = dayjs(startDate);
+    const end = dayjs(endDate);
+    const today = dayjs().format("YYYY-MM-DD");
+    while (current.isSameOrBefore(end)) {
+      const d = current.format("YYYY-MM-DD");
+      if (d !== today) {
+        days.push(d);
+      }
+      current = current.add(1, "day");
+    }
+
+    for (const date of days) {
+      // Obetener el horario del dia 
+      const [infoTurnos] = await db.query(
+        `
+        select * from detailsshift_emp
+        where day = ? and shiftID = 1;
+        `,
+        [capitalizar(dayjs(date).locale("en").format("dddd"))]
+      );
+
+      let entrada = infoTurnos[0]?.startTime || "07:00:00";
+      let salida = infoTurnos[0]?.endTime || "16:45:00";
+
+      // Obetener permisos para rellenar horas por llegada tarde
+      const [permisosLlegadaTarde] = await db.query(
+        `
+        SELECT 
+        permissionID, exitPermission, entryPermission, p.date, p.employeeID,
+        entryTime, exitTime
+        FROM permissionattendance_emp p
+        left join h_attendance_emp h on p.date = h.date and p.employeeID = h.employeeID
+        where p.date = ?
+        and isnull(exitPermission) and isnull(entryPermission)
+        and h.entryTime >= '07:05' and h.exitTime >= ?;
+        `,
+        [dayjs(date).format("YYYYMMDD"), salida]
+      );
+
+      // Obetener permisos que no se utilizaron para eliminarlos
+      const [permisosNoUtilizados] = await db.query(
+        `
+          SELECT 
+          permissionID, exitPermission, entryPermission, p.date, p.employeeID,
+          entryTime, exitTime
+          FROM permissionattendance_emp p
+          left join h_attendance_emp h on p.date = h.date and p.employeeID = h.employeeID
+          where p.date = ?
+          and isnull(exitPermission) and isnull(entryPermission)
+          and h.entryTime <= '07:05' and h.exitTime >= ?;
+        `,
+        [dayjs(date).format("YYYYMMDD"), salida]
+      );
+
+      const [permisosSinRegreso] = await db.query(
+        `
+        SELECT 
+        p.permissionID, p.employeeID, p.exitPermission, p.entryPermission, 
+        a.date assistenciaDate, a.entryTime, a.hattendanceID,
+        COALESCE(
+          (
+            SELECT exHistory.exceptionTime
+            FROM h_assigmentexception_emp hx
+            INNER JOIN exceptions_emp exHistory ON exHistory.exceptionID = hx.exceptionID
+            WHERE hx.employeeID = e.employeeID
+              AND hx.startDate <= DATE(p.date)
+              AND (hx.endDate IS NULL OR hx.endDate >= DATE(p.date))
+            ORDER BY hx.startDate DESC, hx.hassignmentexceptionID DESC
+            LIMIT 1
+          ),
+          CASE
+            WHEN EXISTS (
+              SELECT 1 FROM h_assigmentexception_emp hx
+              WHERE hx.employeeID = e.employeeID
+            ) THEN 0
+            ELSE COALESCE(ex.exceptionTime, 0)
+          END
+        ) AS exceptionTime
+        FROM permissionattendance_emp p
+        inner join h_attendance_emp a on a.employeeID = p.employeeID and p.date = a.date
+        inner join employees_emp e on a.employeeID = e.employeeID
+        left join exceptions_emp ex on e.exceptionID = ex.exceptionID
+        where p.date = ? and !isnull(p.exitPermission) and isnull(p.entryPermission);
+        `,
+        [
+          dayjs(date).format("YYYY-MM-DD")
+        ],
+      );
+      // Rellenar horas de llegada tarde
+      for (const permiso of permisosLlegadaTarde) {
+        await db.query(
+          `
+          UPDATE permissionattendance_emp
+          SET exitPermission = ?, entryPermission = ?,
+          updatedDate = NOW(), updatedBy = 2
+          WHERE permissionID = ?;
+        `,
+          [entrada, permiso.entryTime, permiso.permissionID]
+        );
+      }
+
+      // Eliminar permisos no utilizados
+      for (const permiso of permisosNoUtilizados) {
+        await db.query(
+          `
+          DELETE FROM permissionattendance_emp
+          WHERE permissionID = ?;
+        `,
+          [permiso.permissionID]
+        );
+      }
+
+      // Actualizar permisos sin regreso
+      for (const permiso of permisosSinRegreso) {
+        // Actualizar las horas de salida con el horario del dia
+        await db.query(
+          `
+            UPDATE permissionattendance_emp
+            SET entryPermission = ?
+            WHERE permissionID = ?;
+          `,
+          [dayjs(`${dayjs(date).format("YYYY-MM-DD")} ${salida}`).subtract(permiso.exceptionTime, 'minutes').format("HH:mm:ss"), permiso.permissionID]
+        );
+        await db.query(
+          `
+            UPDATE h_attendance_emp
+            SET exitTime = ?
+            WHERE hattendanceID = ?;
+      `,
+          [permiso.exitPermission, permiso.hattendanceID],
+        );
+      }
+    }
+    res.status(200).json({ success: true, message: "Proceso de limpieza y actualización completado." });
+  } catch (err) {
+    console.error("cleanAndUpdatePermissions error:", err);
+    return res.status(500).json({ success: false, message: t('updateError') });
+  }
+};
+
+// Función para obtener permisos con filtros
+exports.getAllPermissionsWithDetail = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    let filters = [];
+    let params = [];
+    if (isValidString(startDate || dayjs().format("YYYY-MM-DD"))) {
+      filters.push("pa.date >= ?");
+      params.push(startDate || dayjs().format("YYYY-MM-DD"));
+    }
+    if (isValidString(endDate || dayjs().format("YYYY-MM-DD"))) {
+      filters.push("pa.date <= ?");
+      params.push(endDate || dayjs().format("YYYY-MM-DD"));
+    }
+    const whereClause =
+      filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+    const [permissionResults] = await db.query(
+      `
+    	SELECT
+	      pa.permissionID, pa.permissionTypeID, p.permissionTypeName, STR_TO_DATE(pa.date, '%Y-%m-%d') date,
+        pa.comment, pa.isApproved, pa.exitPermission salida, pa.entryPermission entrada, pa.createdDate,
+        CASE 
+          WHEN pa.lunchTime THEN ROUND((TIMESTAMPDIFF(MINUTE, pa.exitPermission, pa.entryPermission)/60) -0.75, 2) 
+          ELSE ROUND(TIMESTAMPDIFF(MINUTE, pa.exitPermission, pa.entryPermission)/60, 2) 
+		    END diffTime, 
+	      CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, e.codeEmployee,
+	      CONCAT(e_aprobador.firstName, ' ', e_aprobador.lastName) AS approvedByFullName,
+	      CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS createdBy, 
+        'Original' Type, pa.lunchTime, pa.isPaid
+	    FROM
+	      permissionattendance_emp pa
+	      INNER JOIN permissiontype_emp p ON p.permissionTypeID = pa.permissionTypeID
+	      INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+	      LEFT JOIN users_us ua ON ua.userID = pa.approvedBy
+	      LEFT JOIN employees_emp e_aprobador ON e_aprobador.employeeID = ua.employeeID
+	      LEFT JOIN users_us uc ON uc.userID = pa.createdBy
+	      LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID
+        ${whereClause}
+	    ORDER BY pa.date ASC, e.codeEmployee ASC, pa.permissionID ASC;
+      `,
+      params
+    );
+
+    const [detailPermissions] = await db.query(
+      `
+        select 
+        dp.detailPermissionID permissionID, 'N/A' permissionTypeID, 'N/A' permissionTypeName, STR_TO_DATE(pa.date, '%Y-%m-%d') date,
+        dp.comment, 1 isApproved, dp.permitStartTime salida, dp.permitEndTime entrada, dp.createdDate,
+        CASE 
+          WHEN dp.lunchTime THEN ROUND((TIMESTAMPDIFF(MINUTE, dp.permitStartTime, dp.permitEndTime)/60) -0.75, 2) 
+          ELSE ROUND(TIMESTAMPDIFF(MINUTE, dp.permitStartTime, dp.permitEndTime)/60, 2) 
+        END diffTime,
+        CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName, e.codeEmployee,
+        CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS approvedByFullName,
+        CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS createdBy, 
+        'Detalle' Type, dp.lunchTime, dp.withPay isPaid
+        from detailpermission_emp dp
+        inner join permissionattendance_emp pa on pa.permissionID = dp.permissionID
+        INNER JOIN employees_emp e ON e.employeeID = pa.employeeID
+        LEFT JOIN users_us uc ON uc.userID = dp.createdBy
+        LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID
+        where dp.permissionID in 
+      (select permissionID from permissionattendance_emp pa ${whereClause});
+      `,
+      params
+    );
+    let combinedResults = [...permissionResults, ...detailPermissions];
+    combinedResults.sort((a, b) => {
+      if (a.date < b.date) return -1;
+      if (a.date > b.date) return 1;
+      if (a.codeEmployee < b.codeEmployee) return -1;
+      if (a.codeEmployee > b.codeEmployee) return 1;
+      return 0;
+    });
+
+    res.json(combinedResults);
+  } catch (err) {
+    console.error("Error fetching permissions with filter:", err);
+    res.status(500).json({
+      message: "Error al cargar permisos con filtro",
+      error: err.message,
+    });
+  }
+};
+
+exports.detailPermissionsByEmployee = async (req, res) => {
+  try {
+    const { employeeID, date } = req.query;
+
+    const [attendance] = await db.query(
+      `
+      select * from
+      h_attendance_emp h 
+      where h.date = ? and h.employeeID = ?;
+      `,
+      [dayjs(date).format('YYYY-MM-DD'), employeeID]
+    );
+
+    const [permissionResults] = await db.query(
+      `
+        select 
+        pa.*, pt.permissionTypeName,
+        CONCAT(e_creador.firstName, ' ', e_creador.lastName) AS createdBy
+        from
+        permissionattendance_emp pa 
+        inner join permissiontype_emp pt on pt.permissionTypeID = pa.permissionTypeID
+        LEFT JOIN users_us uc ON uc.userID = pa.createdBy
+	      LEFT JOIN employees_emp e_creador ON e_creador.employeeID = uc.employeeID
+        where pa.date = ? and pa.employeeID = ?;
+      `,
+      [dayjs(date).format('YYYY-MM-DD'), employeeID]
+    );
+
+    const [permissionDetails] = await db.query(
+      `
+        select 
+        *,
+        CASE 
+          WHEN dp.lunchTime THEN ROUND((TIMESTAMPDIFF(MINUTE, dp.permitStartTime, dp.permitEndTime)/60) -0.75, 2) 
+          ELSE ROUND(TIMESTAMPDIFF(MINUTE, dp.permitStartTime, dp.permitEndTime)/60, 2) 
+        END diffTime
+        from
+        detailpermission_emp dp 
+        where dp.permissionID in (
+          select permissionID from permissionattendance_emp p 
+          where p.date = ? and p.employeeID = ?
+        );
+      `,
+      [dayjs(date).format('YYYY-MM-DD'), employeeID]
+    );
+
+    let permissionWithDetails = permissionResults.map(pr => {
+      return {
+        ...pr,
+        details: permissionDetails.filter(pd => pd.permissionID === pr.permissionID)
+      }
+    });
+
+    res.json({ attendance: attendance[0], permissionWithDetails: permissionWithDetails });
+  } catch (err) {
+    console.log(err);
+
+    res.status(500).json({
+      message: "Error al cargar permisos detallados por empleado",
+      error: err.message,
+    });
+  }
+};
+
+// Verificar si un usuario tiene acceso a un menú específico
+exports.checkUserMenuPermission = async (req, res) => {
+  try {
+    const { userID, menuOptionID } = req.params;
+
+    if (!userID || !menuOptionID) {
+      return res.status(400).json({
+        hasAccess: false,
+        message: "userID y menuOptionID son requeridos"
+      });
+    }
+
+    const [result] = await db.query(
+      `SELECT 1
+       FROM usermenu_us um
+       WHERE um.userID = ?
+         AND um.menuOptionID = ?
+       LIMIT 1`,
+      [userID, menuOptionID]
+    );
+
+    const hasAccess = result.length > 0;
+    res.json({ hasAccess });
+  } catch (error) {
+    console.error('Error checking menu permission:', error);
+    res.status(500).json({
+      hasAccess: false,
+      error: 'Error checking permission'
+    });
+  }
+};

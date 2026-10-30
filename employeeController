@@ -1,0 +1,4820 @@
+const db = require("../config/db");
+const dayjs = require("dayjs");
+const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+require("dayjs/locale/es");
+
+// Extender dayjs con plugins de UTC y Timezone
+dayjs.extend(utc);
+dayjs.extend(timezone);
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const {
+  camposAuditoriaADD,
+  camposAuditoriaUPDATE,
+} = require("../helpers/columnasAuditoria");
+const { isValidNumber, isValidString } = require("../helpers/validator");
+const { formatNamePart } = require("../helpers/formateador");
+const enviarCorreo = require("../helpers/sendEmail");
+const { log } = require("console");
+const { t } = require("i18next");
+const ExcelJS = require("exceljs");
+const { permission } = require("process");
+const { deptoIDsSewing } = require("../helpers/valuesStatic");
+
+// Configuración de almacenamiento con nombre personalizado
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "public/EmpPht");
+  },
+  filename: (req, file, cb) => {
+    const employeeCode = req.params.employeeID;
+    const ext = path.extname(file.originalname);
+    const filename = `${employeeCode}${ext}`;
+
+    // Elimina archivo existente con el mismo nombre si ya existe
+    const filePath = path.join("public/EmpPht", filename);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    cb(null, filename);
+  },
+});
+
+const upload = multer({ storage });
+
+const currentEmployeeShiftSubquery = `
+  COALESCE(
+    (
+      SELECT hs.shiftID
+      FROM h_assigmentshift_emp hs
+      WHERE hs.employeeID = e.employeeID
+        AND CURDATE() BETWEEN DATE(hs.startDate)
+        AND COALESCE(DATE(hs.endDate), DATE('9999-12-31'))
+      ORDER BY hs.startDate DESC, hs.hassigmentshiftID DESC
+      LIMIT 1
+    ),
+    e.shiftID
+  )
+`;
+
+// Obtener todos los empleados (paginado y filtrado)
+exports.getEmployees = async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    const filters = [];
+    const params = [];
+
+    if (req.query.codeEmployee) {
+      filters.push("e.codeEmployee LIKE ?");
+      params.push(`%${req.query.codeEmployee}%`);
+    }
+    if (req.query.fullName) {
+      filters.push("concat(firstName, ' ', middleName, ' ', lastName, ' ', secondLastName) LIKE ?");
+      params.push(`%${req.query.fullName}%`);
+    }
+    if (req.query.departmentID) {
+      filters.push("dep.departmentID = ?");
+      params.push(req.query.departmentID.departmentID);
+    }
+    if (req.query.areaID) {
+      filters.push("a.areaID = ?");
+      params.push(req.query.areaID.areaID);
+    }
+    if (req.query.divisionID) {
+      filters.push("di.divisionID = ?");
+      params.push(req.query.divisionID.divisionID);
+    }
+    if (req.query.jobID) {
+      filters.push("j.jobID = ?");
+      params.push(req.query.jobID.jobID);
+    }
+    if (req.query.shiftID) {
+      filters.push(`${currentEmployeeShiftSubquery} = ?`);
+      params.push(req.query.shiftID);
+    }
+    if (req.query.isActive) { // Active  = 1, Inactive = 0, All = -1
+      if (req.query.isActive !== "-1") {
+        filters.push("e.isActive = ?");
+        params.push(req.query.isActive);
+      }
+    }
+
+    const whereClause = filters.length
+      ? `WHERE e.companyID = 1 AND ${filters.join(" AND ")}`
+      : "WHERE e.companyID = 1";
+    const baseQuery = `
+      FROM employees_emp e
+        INNER JOIN division_emp di  ON di.divisionID   = e.divisionID
+        INNER JOIN area_emp a       ON a.areaID         = e.areaID
+        INNER JOIN department_emp dep ON dep.departmentID = e.departmentID
+        LEFT JOIN shifts_emp shi    ON shi.shiftID     = ${currentEmployeeShiftSubquery}
+        INNER JOIN jobs_emp j       ON j.jobID          = e.jobID
+      ${whereClause}`;
+
+    const [[{ total }]] = await db.query(
+      `SELECT COUNT(*) AS total ${baseQuery}`,
+      params
+    );
+    //para programacion de turnos    
+    // dep.departmentName, j.jobName, e.incapacitated, e.shiftID, shi.shiftName,
+    const [employees] = await db.query(
+      `SELECT
+          e.employeeID, e.codeEmployee,
+          concat(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName,
+          di.divisionName, a.areaName,
+          dep.departmentName, j.jobName, e.incapacitated,
+          ${currentEmployeeShiftSubquery} AS effectiveShiftID,
+          shi.shiftName,
+          if(e.isActive, 'ACTIVO', 'INACTIVO') isActive,
+          e.evaluationStep, e.hireDate, e.exceptionID, e.requiredAttendance
+       ${baseQuery}
+       ORDER BY e.employeeID ASC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    //para programacion de turnos
+    // // e.shiftID, 
+    //       shi.shiftName
+    //     FROM employees_emp e
+    //     LEFT JOIN shifts_emp shi ON shi.shiftID = e.shiftID
+    // Obtener todos los empleados activos
+    const [employeesActives] = await db.query(
+      `SELECT
+          e.employeeID, e.codeEmployee,
+          concat(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName,
+          e.exceptionID,
+          e.shiftID, 
+          shi.shiftName
+        FROM employees_emp e
+        LEFT JOIN shifts_emp shi ON shi.shiftID = e.shiftID
+        Where e.isActive = 1
+       ORDER BY e.employeeID ASC
+      `
+    );
+
+    res.json({
+      data: employees,
+      employeesActives: employeesActives,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+
+exports.exportEmployeesToExcelWithFilters = async (req, res) => {
+  try {
+    const filters = [];
+    const params = [];
+
+    if (req.query.codeEmployee) {
+      filters.push("e.codeEmployee LIKE ?");
+      params.push(`%${req.query.codeEmployee}%`);
+    }
+    if (req.query.fullName) {
+      filters.push("concat(firstName, ' ', middleName, ' ', lastName, ' ', secondLastName) LIKE ?");
+      params.push(`%${req.query.fullName}%`);
+    }
+    if (req.query.departmentID) {
+      filters.push("dep.departmentID = ?");
+      params.push(req.query.departmentID.departmentID);
+    }
+    if (req.query.areaID) {
+      filters.push("a.areaID = ?");
+      params.push(req.query.areaID.areaID);
+    }
+    if (req.query.divisionID) {
+      filters.push("di.divisionID = ?");
+      params.push(req.query.divisionID.divisionID);
+    }
+    if (req.query.jobID) {
+      filters.push("j.jobID = ?");
+      params.push(req.query.jobID.jobID);
+    }
+    if (req.query.shiftID) {
+      filters.push(`${currentEmployeeShiftSubquery} = ?`);
+      params.push(req.query.shiftID);
+    }
+    if (req.query.isActive) { // Active  = 1, Inactive = 0, All = -1
+      if (req.query.isActive !== "-1") {
+        filters.push("e.isActive = ?");
+        params.push(req.query.isActive);
+      }
+    }
+
+    const whereClause = filters.length
+      ? `WHERE e.companyID = 1 AND ${filters.join(" AND ")}`
+      : "WHERE e.companyID = 1";
+
+    const baseQuery = `
+      FROM employees_emp e
+        INNER JOIN division_emp di  ON di.divisionID   = e.divisionID
+        INNER JOIN area_emp a       ON a.areaID         = e.areaID
+        INNER JOIN department_emp dep ON dep.departmentID = e.departmentID
+        LEFT JOIN shifts_emp shi    ON shi.shiftID     = ${currentEmployeeShiftSubquery}
+        INNER JOIN jobs_emp j       ON j.jobID          = e.jobID
+      ${whereClause}`;
+
+    const [employees] = await db.query(
+      `SELECT
+          e.employeeID, e.codeEmployee,
+          concat(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName,
+          di.divisionName, a.areaName, dep.departmentName, j.jobName,
+          ${currentEmployeeShiftSubquery} AS effectiveShiftID,
+          shi.shiftName, if(e.isActive, 'ACTIVO', 'INACTIVO') isActive,
+          e.hireDate
+       ${baseQuery}
+       ORDER BY e.employeeID ASC`,
+      [...params]
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Empleados");
+
+    // Encabezados
+    sheet.columns = [
+      { header: "Código", key: "codeEmployee", width: 12 },
+      { header: "Nombre", key: "fullName", width: 36 },
+      { header: "División", key: "divisionName", width: 18 },
+      { header: "Área", key: "areaName", width: 20 },
+      { header: "Departamento", key: "departmentName", width: 22 },
+      { header: "Cargo", key: "jobName", width: 24 },
+      { header: "Turno", key: "shiftName", width: 12 },
+      { header: "Estado", key: "isActive", width: 10 },
+      { header: "Fecha ingreso", key: "hireDate", width: 16 },
+    ];
+
+    // Estilo de encabezado
+    sheet.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF1F3864" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+      cell.border = {
+        bottom: { style: "thin", color: { argb: "FFAAAAAA" } },
+      };
+    });
+
+    // Filas de datos
+    employees.forEach((emp, index) => {
+      const row = sheet.addRow({
+        ...emp,
+        hireDate: emp.hireDate
+          ? dayjs(emp.hireDate).format("DD/MM/YYYY")
+          : "",
+      });
+
+      // Alternar color de fila
+      if (index % 2 === 0) {
+        row.eachCell((cell) => {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFEEF2F7" },
+          };
+        });
+      }
+
+      row.eachCell((cell) => {
+        cell.alignment = { vertical: "middle" };
+      });
+    });
+
+    // Fila de totales
+    const totalRow = sheet.addRow(["", "", `Total: ${employees.length} empleados`]);
+    totalRow.getCell(3).font = { bold: true };
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="empleados_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al exportar datos de empleados" });
+  }
+};
+
+// Obtener todos los empleados activos
+exports.getEmployeesActives = async (req, res) => {
+  try {
+    const [employees] = await db.query(
+      `
+      SELECT
+          e.employeeID, e.codeEmployee, concat(firstName, " ", middleName, 
+          " ", lastName, " ", secondLastName) fullName, e.jobID, e.exceptionID
+        FROM employees_emp e
+              INNER JOIN division_emp di on di.divisionID = e.divisionID
+              INNER JOIN area_emp a on a.areaID = e.areaID
+              INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+              INNER JOIN shifts_emp shi on shi.shiftID = e.shiftID
+              INNER JOIN jobs_emp j on j.jobID = e.jobID
+              where e.companyID = 1 AND e.isActive = 1
+              ORDER BY e.employeeID asc;
+      `
+    );
+
+    res.json(employees);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+
+//nuevo 
+exports.getEmployeesRequiredAttendance = async (req, res) => {
+  try {
+    const { supervisorID, allWithLines } = req.query;
+
+    let query = "";
+    let queryParams = [];
+
+    if (supervisorID) {
+      // CORREGIDO: Se cambia 'e.firstName ASC' por 'fullName ASC' en el ORDER BY
+      query = `
+        SELECT DISTINCT
+            e.employeeID, 
+            e.codeEmployee, 
+            CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName, 
+            e.jobID, 
+            e.exceptionID,
+            l.linesID,
+            l.linesNumber
+        FROM employees_emp e
+        INNER JOIN employeelines_emp el ON e.employeeID = el.employeeID
+        INNER JOIN lines_emp l ON el.linesID = l.linesID
+        WHERE l.supervisorID = ? 
+          AND e.companyID = 1 
+          AND e.isActive = 1
+          AND e.requiredAttendance = 1
+        ORDER BY l.linesNumber ASC, fullName ASC;
+      `;
+      queryParams = [supervisorID];
+
+    } else if (allWithLines === 'true' || allWithLines === true) {
+      // 2. NUEVO CASO SEGURO: Trae todos pero incluyendo sus líneas reales (Solo para PermissionLow)
+      query = `
+        SELECT
+            e.employeeID, 
+            e.codeEmployee, 
+            CONCAT(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName, 
+            e.jobID, 
+            e.exceptionID,
+            l.linesID,
+            l.linesNumber
+        FROM employees_emp e
+        INNER JOIN division_emp di on di.divisionID = e.divisionID
+        INNER JOIN area_emp a on a.areaID = e.areaID
+        INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+        INNER JOIN shifts_emp shi on shi.shiftID = e.shiftID
+        INNER JOIN jobs_emp j on j.jobID = e.jobID
+        LEFT JOIN employeelines_emp el ON e.employeeID = el.employeeID
+        LEFT JOIN lines_emp l ON el.linesID = l.linesID
+        WHERE e.companyID = 1 
+          AND e.isActive = 1
+          AND e.requiredAttendance = 1
+       ORDER BY CAST(e.codeEmployee AS UNSIGNED) ASC, e.hireDate ASC;
+      `;
+    } else {
+      // Consulta original global (queda intacta tal y como funciona en otras pantallas)
+      query = `
+        SELECT
+            e.employeeID, 
+            e.codeEmployee, 
+            CONCAT(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName, 
+            e.jobID, 
+            e.exceptionID,
+            NULL AS linesID,
+            NULL AS linesNumber
+        FROM employees_emp e
+        INNER JOIN division_emp di on di.divisionID = e.divisionID
+        INNER JOIN area_emp a on a.areaID = e.areaID
+        INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+        INNER JOIN shifts_emp shi on shi.shiftID = e.shiftID
+        INNER JOIN jobs_emp j on j.jobID = e.jobID
+        WHERE e.companyID = 1 
+          AND e.isActive = 1
+          AND e.requiredAttendance = 1
+        ORDER BY e.employeeID ASC;
+      `;
+    }
+
+    const [employees] = await db.query(query, queryParams);
+    res.json(employees);
+  } catch (error) {
+    console.error("Error en getEmployeesRequiredAttendance:", error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+// exports.getEmployeeRequiredAttendanceLow = async (req, res) => {
+
+//   try {
+//     // 1. Capturamos el supervisorID si viene en la URL (?supervisorID=X)
+//     const { supervisorID } = req.query;
+
+//     let query = "";
+//     let queryParams = [];
+
+//     if (supervisorID) {
+//       // Si hay un supervisor, filtramos los empleados que pertenezcan a su línea asignada
+//       query = `
+//         SELECT DISTINCT
+//             e.employeeID,
+//             e.codeEmployee,
+//             CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName
+//         FROM pmsdev.employees_emp e
+//         INNER JOIN pmsdev.employeelines_emp el ON e.employeeID = el.employeeID
+//         INNER JOIN pmsdev.lines_emp l ON el.linesID = l.linesID
+//         WHERE l.supervisorID = ? AND e.status = 1
+//         ORDER BY e.firstName ASC;
+//       `;
+//       queryParams = [supervisorID];
+//     } else {
+//       // Consulta original por defecto si no se pasa un supervisor (Carga global)
+//       query = `
+//         SELECT 
+//             employeeID,
+//             codeEmployee,
+//             CONCAT_WS(' ', firstName, middleName, lastName, secondLastName) AS fullName
+//         FROM pmsdev.employees_emp
+//         WHERE deptoID IN (${deptoIDsSewing.join(",")}) AND status = 1
+//         ORDER BY firstName ASC;
+//       `;
+//     }
+
+//     const [rows] = await db.query(query, queryParams);
+//     return res.status(200).json(rows);
+
+//   } catch (error) {
+//     console.error("Error al obtener empleados para asistencia:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Error interno del servidor",
+//     });
+//   }
+// };
+
+// Obtener todos los empleados presente en piso
+exports.getPresentEmployees = async (req, res) => {
+  try {
+    const currentDate = dayjs().format("YYYY-MM-DD");
+    const [employees] = await db.query(
+      `
+      SELECT DISTINCT
+         e.employeeID,
+         CONCAT(e.employeeID, ' - ', e.firstName, ' ', COALESCE(e.middleName, ''), ' ', e.lastName) AS fullName
+      FROM
+          employees_emp e
+          INNER JOIN h_attendance_emp a ON e.employeeID = a.employeeID
+      WHERE
+          a.date = ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM dispatching_emp d
+              WHERE d.employeeID = e.employeeID
+              AND d.date = ?
+          )
+      `,
+      [currentDate, currentDate]
+    );
+
+    res.json(employees);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+
+// Get para un solo empleado
+exports.getEmployeeByID = async (req, res) => {
+  try {
+    let employeeID = req.params.employeeID;
+    if (!isValidNumber(employeeID)) {
+      return res.status(400).json({ message: "ID de empleado no válido" });
+    }
+
+    //para programacion de turnos
+    //  e.contractTypeID, cont.statusDesc, e.payrollTypeID, pay.payrollName, 
+    //     IFNULL(h_shift.shiftID, e.shiftID) AS shiftID,
+    //     IFNULL(s_hist.shiftName, shi.shiftName) AS shiftName,
+    //     e.educationLevelID, 
+
+
+    //en los inner
+    //  LEFT JOIN shifts_emp shi on shi.shiftID = e.shiftID
+    //     LEFT JOIN h_assigmentshift_emp h_shift ON h_shift.hassigmentshiftID = (
+    //         SELECT hassigmentshiftID 
+    //         FROM h_assigmentshift_emp 
+    //         WHERE employeeID = e.employeeID 
+    //         ORDER BY startDate DESC, hassigmentshiftID DESC 
+    //         LIMIT 1
+    //     )
+    //     LEFT JOIN shifts_emp s_hist ON s_hist.shiftID = h_shift.shiftID
+
+    const [employee] = await db.query(
+      `select
+        e.employeeID, e.codeEmployee, concat(e.firstName,' ',e.middleName,' ',e.lastName ,' ', e.secondLastName) fullName,
+        e.firstName,e.middleName,e.lastName ,e.secondLastName, e.phoneNumber, e.birthDate, e.photoUrl, e.genderID, g.genderName, 
+        e.docID, d.docTypeName, e.docNumber, e.bloodTypeID, b.bloodTypeName, e.hireDate, e.endDate, e.isActive, e.partnerName, 
+        dismissal.dateDismissal, dismissal.dismissalTypeID, disType.dismissalDesc, dismissal.comment,
+        e.partnerage, e.stateID, st.stateName, e.cityID, c.cityName, e.sectorID, se.sectorName, e.suburbID, su.suburbName, e.address, 
+        e.gabachSize, sg.sizeName as gabacha, e.shirtSize, ssh.sizeName as shirt, e.divisionID, di.divisionName, e.areaID, a.areaName, 
+        e.departmentID, dep.departmentName, e.jobID, e.managerID, j.jobName, e.companyID, com.companyName, et.employeeTypeDesc, et.employeeTypeID,
+        e.contractTypeID, cont.statusDesc, e.payrollTypeID, pay.payrollName, 
+        IFNULL(h_shift.shiftID, e.shiftID) AS shiftID,
+        IFNULL(s_hist.shiftName, shi.shiftName) AS shiftName,
+        e.educationLevelID, 
+        el.educationLevelName, e.educationGrade, e.transportTypeID, t.transportTypeName, e.maritalStatusID, m.maritalStatusName, 
+        e.nationality, e.evaluationStep, e.incapacitated, e.salary, IF(e.relatives, true, false) relatives, IF(e.requiredAttendance, true, false) requiredAttendance,
+        e.createdBy, e.createdDate, 
+        e.updatedBy, e.updatedDate, line.linesID, line.linesNumber, line.supervisorID supervisorLine, 
+        concat(sup.firstName,' ',sup.middleName,' ',sup.lastName ,' ', sup.secondLastName) supervisorName
+      from employees_emp e
+        INNER JOIN gender_emp g on g.genderID = e.genderID
+        INNER JOIN doctypes_emp d on d.docID = e.docID
+        INNER JOIN bloodtype_emp b on b.bloodTypeID = e.bloodTypeID
+        INNER JOIN states_emp st on st.stateID = e.stateID
+        INNER JOIN cities_emp c on c.cityID = e.cityID
+        INNER JOIN sectors_emp se on se.sectorID = e.sectorID
+        INNER JOIN suburbs_emp su on su.suburbID = e.suburbID
+        INNER JOIN sizes_emp sg on sg.sizeID = e.gabachSize
+        INNER JOIN sizes_emp ssh on ssh.sizeID = e.shirtSize
+        INNER JOIN division_emp di on di.divisionID = e.divisionID
+        INNER JOIN area_emp a on a.areaID = e.areaID
+        INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+        INNER JOIN jobs_emp j on j.jobID = e.jobID
+        INNER JOIN companies_us com on com.companyID = e.companyID
+        INNER JOIN employeetype_emp et on et.employeeTypeID = e.employeeTypeID
+        INNER JOIN contracttype_emp cont on cont.contractTypeID = e.contractTypeID
+        INNER JOIN payrolltype_emp pay on pay.payrollTypeID = e.payrollTypeID
+        LEFT JOIN shifts_emp shi on shi.shiftID = e.shiftID
+        LEFT JOIN h_assigmentshift_emp h_shift ON h_shift.hassigmentshiftID = (
+            SELECT hassigmentshiftID 
+            FROM h_assigmentshift_emp 
+            WHERE employeeID = e.employeeID 
+            ORDER BY startDate DESC, hassigmentshiftID DESC 
+            LIMIT 1
+        )
+        LEFT JOIN shifts_emp s_hist ON s_hist.shiftID = h_shift.shiftID
+        INNER JOIN educationlevel_emp el on el.educationLevelID = e.educationLevelID
+        INNER JOIN transportation_emp t on t.transportTypeID = e.transportTypeID
+        INNER JOIN maritalstatus_emp m on m.maritalStatusID = e.maritalStatusID
+        LEFT JOIN employeelines_emp empLine on empLine.employeeID = e.employeeID
+        LEFT JOIN lines_emp line on line.linesID = empLine.linesID
+        LEFT JOIN employees_emp sup on sup.employeeID = line.supervisorID
+        LEFT JOIN h_dismissal_emp dismissal on dismissal.employeeID = e.employeeID
+        LEFT JOIN dismissaltype_emp disType on disType.dismissalTypeID = dismissal.dismissalTypeID
+      WHERE e.employeeID = ${employeeID};`
+    );
+
+    const [children] = await db.query(`
+        select
+            f.childrenID, f.firstName, f.middleName, f.lastName, f.secondLastName,
+            concat(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) fullName,
+            f.birthDate, f.birthCert, g.genderName, g.genderID
+        from children_emp f
+        INNER JOIN gender_emp g on g.genderID = f.genderID
+        where f.employeeID = ${employeeID};
+      `);
+
+    const [familyInformation] = await db.query(`
+          select
+          	f.familyInfoID, f.firstName, f.middleName, f.lastName, f.secondLastName,
+            concat(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) fullName,
+            f.age, r.relativesTypeDesc, r.relativesTypeID
+          from familyinformation_emp f
+          INNER JOIN relativestype_emp r on r.relativesTypeID = f.relativesTypeID
+          where f.employeeID = ${employeeID};
+      `);
+
+    const [econtact] = await db.query(`
+      select
+          e.econtactID, e.firstName, e.middleName, e.lastName, e.secondLastName,
+          concat(e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) fullName,
+          e.phoneNumber, r.relativesTypeDesc, r.relativesTypeID,
+          concat(st.stateName, ', ', c.cityName, ', ', se.sectorName, ', ', su.suburbName) direccion,
+          st.stateID, st.stateName, c.cityID, c.cityName, se.sectorID, se.sectorName, su.suburbID, su.suburbName
+      from econtacts_emp e
+          INNER JOIN relativestype_emp r on r.relativesTypeID = e.relativesTypeID
+          INNER JOIN states_emp st on st.stateID = e.stateID
+          INNER JOIN cities_emp c on c.cityID = e.cityID
+          INNER JOIN sectors_emp se on se.sectorID = e.sectorID
+          INNER JOIN suburbs_emp su on su.suburbID = e.suburbID
+      where e.employeeID = ${employeeID};
+      `);
+
+    const [auxrelative] = await db.query(`
+        select
+          au.auxRelativeID, e.employeeID, e.firstName, e.middleName, e.lastName, e.secondLastName, au.newEmployee,
+          concat(e.codeEmployee,' - ', e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) completeName,
+          r.relativesTypeDesc, r.relativesTypeID
+        from auxrelative_emp au
+        INNER JOIN employees_emp e on e.employeeID = au.employeeID
+          INNER JOIN relativestype_emp r on r.relativesTypeID = au.relativesTypeID
+        where au.newEmployee = ${employeeID};
+      `);
+
+    const [beneficiaries] = await db.query(`
+      select
+	      f.beneficiaryID, f.employeeID, f.firstName,  f.middleName,  f.lastName,  f.secondLastName,
+	      concat(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) completeName,
+        f.percentage, r.relativesTypeDesc, f.relativesTypeID, f.phoneNumber
+      from beneficiaries_emp f
+        INNER JOIN relativestype_emp r on r.relativesTypeID = f.relativesTypeID
+      where f.employeeID = ${employeeID};
+      `);
+
+    res.status(201).json({
+      employee,
+      children,
+      familyInformation,
+      econtact,
+      auxrelative,
+      beneficiaries,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener dato del empleado" });
+  }
+};
+
+// Actualizar evaluación del empleado
+exports.updateEvaluation = async (req, res) => {
+  try {
+    const { employeeID } = req.params;
+    const { evaluationStep } = req.body;
+
+    if (!isValidNumber(employeeID)) {
+      return res.status(400).json({ message: "ID de empleado no válido" });
+    }
+
+    const [result] = await db.query(
+      `UPDATE employees_emp SET evaluationStep = ?, updatedDate= ?, updatedBy = ? WHERE employeeID = ?`,
+      [evaluationStep, ...camposAuditoriaUPDATE(req), employeeID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ message: "Empleado no encontrado" });
+    }
+
+    res.status(200).json({ message: "Evaluación actualizada correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar evaluación del empleado" });
+  }
+};
+
+exports.updateRequiredAttendance = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+    const { employeeID } = req.params;
+    const { requiredAttendance } = req.body;
+
+    const [result] = await db.query(`
+    
+    UPDATE employees_emp 
+       SET requiredAttendance = ?
+       WHERE employeeID = ?
+
+  `, [requiredAttendance, employeeID])
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: t("employeenotfound", language) });
+    }
+
+    res.status(200).json({ message: t("updateSuccess", language) });
+
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+
+}
+
+// Get para buscar empleados
+exports.getEmployeeSearch = async (req, res) => {
+  try {
+    const { searchTerm } = req.params;
+    const [employee] = await db.query(
+      `SELECT employeeID, completeName from
+        (SELECT e.employeeID, concat(e.codeEmployee, ' - ', firstName, " ", middleName, " ", lastName, " ", secondLastName) completeName, e.isActive
+       FROM employees_emp e) as emp
+       WHERE emp.completeName like ? and emp.isActive = 1
+       LIMIT 10;`,
+      [`%${searchTerm}%`]
+    );
+
+    res.status(201).send(employee);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener dato del empleado" });
+  }
+};
+
+exports.createEmployee = async (req, res) => {
+  try {
+    const [correlative] = await db.query(
+      "SELECT lastUsed FROM correlative where companyID = 1 and correlativeID = 1"
+    );
+    if (correlative.length === 0) {
+      return res
+        .status(500)
+        .json({ message: "Error al obtener el correlativo" });
+    }
+    const [result] = await db.query(
+      `INSERT INTO employees_emp (
+          codeEmployee, firstName, middleName, lastName, secondLastName, phoneNumber, genderID, docID, docNumber, photoUrl,
+          birthDate, bloodTypeID, cityID, stateID, sectorID, suburbID, address, gabachSize, shirtSize, divisionID,
+          departmentID, areaID, jobID, hireDate, endDate, isActive,managerID, partnerName, partnerage, companyID,
+          employeeTypeID, contractTypeID, payrollTypeID, shiftID, educationLevelID, educationGrade, transportTypeID, 
+          maritalStatusID, nationality, evaluationStep, incapacitated, exceptionID,requiredAttendance, salary, relatives, createdDate, createdBy
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? , ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ,?, ?)`,
+      [
+        correlative[0].lastUsed + 1,
+        formatNamePart(req.body.employeeData.firstName),
+        formatNamePart(req.body.employeeData.middleName),
+        formatNamePart(req.body.employeeData.lastName),
+        formatNamePart(req.body.employeeData.secondLastName),
+        req.body.employeeData.phoneNumber,
+        req.body.employeeData.genderID,
+        req.body.employeeData.docID,
+        req.body.employeeData.docNumber,
+        req.body.employeeData.photoUrl,
+        dayjs(req.body.employeeData.birthDate).format("YYYY-MM-DD"),
+        req.body.employeeData.bloodTypeID,
+        req.body.employeeData.cityID.cityID,
+        req.body.employeeData.stateID.stateID,
+        req.body.employeeData.sectorID.sectorID,
+        req.body.employeeData.suburbID.suburbID,
+        req.body.employeeData.address,
+        req.body.employeeData.gabachSize.sizeID,
+        req.body.employeeData.shirtSize.sizeID,
+        req.body.employeeData.divisionID.divisionID,
+        req.body.employeeData.departmentID.departmentID,
+        req.body.employeeData.areaID.areaID,
+        req.body.employeeData.jobID.jobID,
+        dayjs(req.body.employeeData.hireDate).format("YYYY-MM-DD"),
+        isValidString(req.body.employeeData.endDate)
+          ? isValidString(req.body.employeeData.endDate).format("YYYY-MM-DD")
+          : null,
+        req.body.employeeData.isActive,
+        req.body.employeeData.managerID,
+        req.body.employeeData.partnerName,
+        parseInt(req.body.employeeData.partnerage),
+        req.body.employeeData.companyID,
+        req.body.employeeData.employeeTypeID,
+        req.body.employeeData.contractTypeID,
+        req.body.employeeData.payrollTypeID,
+        req.body.employeeData.shiftID,
+        req.body.employeeData.educationLevelID,
+        req.body.employeeData.educationGrade,
+        req.body.employeeData.transportTypeID,
+        req.body.employeeData.maritalStatusID,
+        req.body.employeeData.nationality,
+        req.body.employeeData.evaluationStep,
+        req.body.employeeData.incapacitated,
+        req.body.employeeData.exceptionID || 3,
+        1,
+        req.body.employeeData.salary,
+        req.body.employeeData.relatives,
+        camposAuditoriaADD(req), // Fecha y usuario de creación
+      ]
+    );
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ message: "Error al crear el empleado" });
+    }
+    await db.query(
+      `UPDATE correlative SET lastUsed = ${correlative[0].lastUsed + 1
+      }  WHERE (correlativeID = 1)`
+    );
+
+    const employeeID = result.insertId;
+
+    req.body.childrenList.forEach(async (x) => {
+      await db.query(
+        `INSERT INTO children_emp (firstName, middleName, lastName, secondLastName,
+            birthDate, birthCert, genderID, employeeID, createdDate, createdBy
+            )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? )`,
+        [
+          formatNamePart(x.firstName),
+          formatNamePart(x.middleName),
+          formatNamePart(x.lastName),
+          formatNamePart(x.secondLastName),
+          dayjs(x.birthDate).format("YYYY-MM-DD"),
+          x.birthCert,
+          x.genderID,
+          employeeID,
+          camposAuditoriaADD(req),
+        ]
+      );
+    });
+
+    req.body.familyList.forEach(async (x) => {
+      await db.query(
+        `INSERT INTO familyinformation_emp (relativesTypeID, firstName, middleName, lastName,
+            secondLastName, age, employeeID, createdDate, createdBy
+            )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          x.relativesTypeID,
+          formatNamePart(x.firstName),
+          formatNamePart(x.middleName),
+          formatNamePart(x.lastName),
+          formatNamePart(x.secondLastName),
+          parseInt(x?.age) || null,
+          employeeID,
+          camposAuditoriaADD(req),
+        ]
+      );
+    });
+
+    req.body.emergencyList.forEach(async (x) => {
+      await db.query(
+        `INSERT INTO econtacts_emp (firstName, middleName, lastName, secondLastName,
+            stateID, cityID, sectorID, suburbID, relativesTypeID, phoneNumber,
+            employeeID, createdDate, createdBy
+            )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          formatNamePart(x.firstName),
+          formatNamePart(x.middleName),
+          formatNamePart(x.lastName),
+          formatNamePart(x.secondLastName),
+          x.stateID,
+          x.cityID,
+          x.sectorID,
+          x.suburbID,
+          x.relativesTypeID,
+          x.phoneNumber,
+          employeeID,
+          camposAuditoriaADD(req),
+        ]
+      );
+    });
+
+    if (req.body.employeeData.relatives) {
+      req.body.familyPAHList.forEach(async (x) => {
+        await db.query(
+          `INSERT INTO auxrelative_emp (relativesTypeID, newEmployee, employeeID,
+            createdDate, createdBy
+            )
+        VALUES (?, ?, ?, ?)`,
+          [x.relativesTypeID, employeeID, x.employeeID, camposAuditoriaADD(req)]
+        );
+      });
+    }
+
+    req.body.beneficiariesList.forEach(async (x) => {
+      await db.query(
+        `INSERT INTO beneficiaries_emp (firstName, middleName, lastName,
+            secondLastName, percentage, relativesTypeID,
+            phoneNumber, employeeID, createdDate, createdBy
+            )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          formatNamePart(x.firstName),
+          formatNamePart(x.middleName),
+          formatNamePart(x.lastName),
+          formatNamePart(x.secondLastName),
+          parseInt(x.percentage),
+          x.relativesTypeID,
+          x.phoneNumber,
+          employeeID,
+          camposAuditoriaADD(req),
+        ]
+      );
+    });
+
+   if (req.body.employeeData.shiftID) {
+    await db.query(
+        `INSERT INTO h_assigmentshift_emp (employeeID, shiftID, startDate, endDate, comments, createdDate, createdBy)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+            employeeID,
+            req.body.employeeData.shiftID,
+            req.body.employeeData.shiftStartDate ? dayjs(req.body.employeeData.shiftStartDate).format("YYYY-MM-DD") : dayjs().format("YYYY-MM-DD"),
+            req.body.employeeData.shiftEndDate ? dayjs(req.body.employeeData.shiftEndDate).format("YYYY-MM-DD") : null,
+            req.body.employeeData.shiftComments || null,
+        ...camposAuditoriaADD(req)
+        ]
+    );
+}
+
+    await db.query(
+      `INSERT INTO h_assigmentexception_emp
+        (employeeID, exceptionID, startDate, endDate, comments, createdDate, createdBy)
+       VALUES (?, 3, ?, NULL, NULL, ?, ?)`,
+      [
+        employeeID,
+        dayjs(req.body.employeeData.hireDate).format("YYYY-MM-DD"),
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+    const [employee] = await db.query(
+      `SELECT
+          e.employeeID, e.codeEmployee, concat(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName,
+          dep.departmentName, j.jobName, e.incapacitated, shi.shiftName,e.requiredAttendance, e.isActive, e.docNumber, if (e.isActive, 'ACTIVO', 'INACTIVO') isActive
+        FROM employees_emp e
+              INNER JOIN division_emp di on di.divisionID = e.divisionID
+              INNER JOIN area_emp a on a.areaID = e.areaID
+              INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+              INNER JOIN shifts_emp shi on shi.shiftID = e.shiftID
+              INNER JOIN jobs_emp j on j.jobID = e.jobID
+              where e.employeeID = ${employeeID}
+        ORDER BY e.employeeID asc;`
+    );
+    //cambie sistema_asistenciados por sistema_asis en la consulta de insercion de empleados
+    await db.query(
+      `INSERT INTO sistema_asis.empleados   
+        (codigo, dni, cargo, nombre, foto, status)
+        VALUES (?, ?, ?, ?, ?, ?);`,
+      [
+        employee[0].codeEmployee,
+        employee[0].docNumber,
+        employee[0].jobName,
+        `${formatNamePart(req.body.employeeData.firstName)} ${formatNamePart(req.body.employeeData.middleName)} ${formatNamePart(req.body.employeeData.lastName)} ${formatNamePart(req.body.employeeData.secondLastName)}`,
+        `EmpPht${employee[0].employeeID}.jpg`,
+        employee[0].isActive ? 'Activo' : 'Inactivo'
+      ]
+    );
+
+    res.status(201).json({
+      newEmployee: employee,
+      message: "Empleado creado correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al crear el usuario" });
+  }
+};
+
+//Obtener gerentes para empleados:
+exports.getManagersEmployees = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  try {
+    const [managers] = await db.query(
+      `
+    select * from employees_emp emp
+    inner join jobs_emp j on emp.jobID = j.jobID
+    where j.jobName like '%Gerente%' or employeeID =10;
+
+    `
+    )
+
+    res.status(200).json(managers);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+
+}
+
+// Obtener todos los empleados
+exports.getSupervisorSewing = async (req, res) => {
+  try {
+    const [supervisores] = await db.query(
+      `
+        select e.employeeID supervisorID, concat(e.firstName,' ',
+        e.middleName,' ',e.lastName) supervisorName
+        from employees_emp e
+        INNER JOIN jobs_emp j on e.jobID = j.jobID
+        where e.isActive = 1 and (e.jobID = 41 or e.jobID = 80);
+      `
+    );
+
+    res.status(200).json(supervisores);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+
+exports.getEmployeesSewing = async (req, res) => {
+  try {
+    const [employees] = await db.query(
+      `
+        select e.employeeID, e.codeEmployee, j.jobName,
+        concat(e.firstName,' ', e.middleName,' ', e.lastName) employeeName, e.photoUrl
+        from employees_emp e
+          INNER JOIN jobs_emp j on e.jobID = j.jobID
+        where e.companyID = 1 and e.isActive = 1 and e.departmentID IN (${deptoIDsSewing.join(",")});
+      `
+    );
+
+    res.status(200).json(employees);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener datos de empleados" });
+  }
+};
+
+// exports.getEmployeesAssignToLine = async (req, res) => {
+//   try {
+//     const [result] = await db.query(
+//       `
+//         SELECT COUNT(DISTINCT employeeID) AS totalAssigned 
+//         FROM employeelines_emp;
+//       `
+//     );
+
+//     // Enviamos el primer registro del resultado: { totalAssigned: X }
+//     res.status(200).json(result[0]);
+//   } catch (error) {
+//     console.error("Error en getEmployeesAssignToLine:", error);
+//     res.status(500).json({ message: "Error al obtener el conteo de empleados asignados" });
+//   }
+// };
+
+exports.updateEmployee = async (req, res) => {
+  try {
+    const { employeeID } = req.params;
+    const schedulesManagedSeparately = req.body.schedulesManagedSeparately === true;
+    //Actualizar datos del empleado
+    if (!isValidNumber(employeeID)) {
+      return res.status(400).json({ message: "ID de empleado inválido" });
+    }
+    const [result] = await db.query(
+      `UPDATE employees_emp SET
+          firstName = ?, middleName = ?, lastName = ?,
+          secondLastName = ?, phoneNumber = ?, genderID = ?,
+          docID = ?, docNumber = ?, birthDate = ?,
+          bloodTypeID = ?, cityID = ?, stateID = ?,
+          sectorID = ?, suburbID = ?, address = ?,
+          gabachSize = ?, shirtSize = ?, divisionID = ?,
+          departmentID = ?, areaID = ?, jobID = ?, managerID = ?,
+          hireDate = ?, partnerName = ?, partnerage = ?,
+          employeeTypeID =?, contractTypeID = ?, payrollTypeID = ?,
+          shiftID = IF(?, shiftID, ?), exceptionID = IF(?, exceptionID, ?),
+          educationLevelID = ?, educationGrade = ?, transportTypeID = ?,
+          maritalStatusID = ?, nationality = ?, salary = ?,
+          relatives = ?,
+          requiredAttendance = ?, 
+          updatedDate = ?, updatedBy = ?
+          
+      WHERE employeeID = ?`,
+      [
+        formatNamePart(req.body.employeeData.firstName),
+        formatNamePart(req.body.employeeData.middleName),
+        formatNamePart(req.body.employeeData.lastName),
+        formatNamePart(req.body.employeeData.secondLastName),
+        req.body.employeeData.phoneNumber,
+        req.body.employeeData.genderID,
+        req.body.employeeData.docID,
+        req.body.employeeData.docNumber,
+        dayjs(req.body.employeeData.birthDate).format("YYYY-MM-DD"),
+        req.body.employeeData.bloodTypeID,
+        req.body.employeeData.cityID.cityID,
+        req.body.employeeData.stateID.stateID,
+        req.body.employeeData.sectorID.sectorID,
+        req.body.employeeData.suburbID.suburbID,
+        req.body.employeeData.address,
+        req.body.employeeData.gabachSize.sizeID,
+        req.body.employeeData.shirtSize.sizeID,
+        req.body.employeeData.divisionID.divisionID,
+        req.body.employeeData.departmentID.departmentID,
+        req.body.employeeData.areaID.areaID,
+        req.body.employeeData.jobID.jobID,
+        req.body.employeeData.managerID,
+        dayjs(req.body.employeeData.hireDate).format("YYYY-MM-DD"),
+        req.body.employeeData.partnerName,
+        parseInt(req.body.employeeData.partnerage),
+        req.body.employeeData.employeeTypeID,
+        req.body.employeeData.contractTypeID,
+        req.body.employeeData.payrollTypeID,
+        schedulesManagedSeparately,
+        req.body.employeeData.shiftID,
+        schedulesManagedSeparately,
+        req.body.employeeData.exceptionID || 3,
+        req.body.employeeData.educationLevelID,
+        req.body.employeeData.educationGrade,
+        req.body.employeeData.transportTypeID,
+        req.body.employeeData.maritalStatusID,
+        req.body.employeeData.nationality,
+        req.body.employeeData.salary,
+        req.body.employeeData.relatives,
+        req.body.employeeData.requiredAttendance,
+        ...camposAuditoriaUPDATE(req),
+        employeeID,
+      ]
+    );
+
+    // 1. Manejo del Turno al actualizar datos generales
+    if (!schedulesManagedSeparately && req.body.employeeData.shiftID) {
+      const formattedStartDate = req.body.employeeData.shiftStartDate 
+        ? dayjs(req.body.employeeData.shiftStartDate).format("YYYY-MM-DD") 
+        : dayjs().format("YYYY-MM-DD");
+      
+      const formattedEndDate = req.body.employeeData.shiftEndDate 
+        ? dayjs(req.body.employeeData.shiftEndDate).format("YYYY-MM-DD") 
+        : null;
+
+      // Verificamos si ya existe un registro activo para ese empleado en esa fecha exacta o cerramos el anterior
+      await db.query(
+        `UPDATE h_assigmentshift_emp
+         SET endDate = DATE_SUB(?, INTERVAL 1 DAY)
+         WHERE employeeID = ?
+           AND DATE(startDate) < ?
+           AND (endDate IS NULL OR DATE(endDate) >= ?)
+           AND shiftID <> ?`,
+        [formattedStartDate, employeeID, formattedStartDate, formattedStartDate, req.body.employeeData.shiftID]
+      );
+
+      // Comprobamos si ya existe el turno exacto para actualizarlo en lugar de insertar uno nuevo duplicado
+      const [existingShift] = await db.query(
+        `SELECT hassigmentshiftID FROM h_assigmentshift_emp 
+         WHERE employeeID = ? AND DATE(startDate) = ? LIMIT 1`,
+        [employeeID, formattedStartDate]
+      );
+
+      if (existingShift.length > 0) {
+        // Si ya hay un registro en esa misma fecha, lo actualizamos
+        await db.query(
+          `UPDATE h_assigmentshift_emp 
+           SET shiftID = ?, endDate = ?, comments = ?, updatedDate = ?, updatedBy = ?
+           WHERE hassigmentshiftID = ?`,
+          [
+            req.body.employeeData.shiftID,
+            formattedEndDate,
+            req.body.employeeData.shiftComments || null,
+            ...camposAuditoriaUPDATE(req),
+            existingShift[0].hassigmentshiftID
+          ]
+        );
+      } else {
+        // Si no existe, insertamos el nuevo registro en el histórico
+        await db.query(
+          `INSERT INTO h_assigmentshift_emp (employeeID, shiftID, startDate, endDate, comments, createdDate, createdBy)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            employeeID,
+            req.body.employeeData.shiftID,
+            formattedStartDate,
+            formattedEndDate,
+            req.body.employeeData.shiftComments || null,
+            ...camposAuditoriaADD(req)
+          ]
+        );
+      }
+
+      await syncEmployeeShiftFromHistory(employeeID, req);
+    }
+
+    // 2. Manejo de la Excepción al actualizar datos generales
+    if (!schedulesManagedSeparately && req.body.employeeData.exceptionID) {
+      const formattedExcStartDate = req.body.employeeData.exceptionStartDate 
+        ? dayjs(req.body.employeeData.exceptionStartDate).format("YYYY-MM-DD") 
+        : dayjs().format("YYYY-MM-DD");
+      
+      const formattedExcEndDate = req.body.employeeData.exceptionEndDate 
+        ? dayjs(req.body.employeeData.exceptionEndDate).format("YYYY-MM-DD") 
+        : null;
+
+      const [existingException] = await db.query(
+        `SELECT hassignmentexceptionID FROM h_assigmentexception_emp 
+         WHERE employeeID = ? AND DATE(startDate) = ? LIMIT 1`,
+        [employeeID, formattedExcStartDate]
+      );
+
+      if (existingException.length > 0) {
+        await db.query(
+          `UPDATE h_assigmentexception_emp 
+           SET exceptionID = ?, endDate = ?, comments = ?, updatedDate = ?, updatedBy = ?
+           WHERE hassignmentexceptionID = ?`,
+          [
+            req.body.employeeData.exceptionID,
+            formattedExcEndDate,
+            req.body.employeeData.exceptionComments || null,
+            ...camposAuditoriaUPDATE(req),
+            existingException[0].hassignmentexceptionID
+          ]
+        );
+      } else {
+        await db.query(
+          `INSERT INTO h_assigmentexception_emp (employeeID, exceptionID, startDate, endDate, comments, createdDate, createdBy)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            employeeID,
+            req.body.employeeData.exceptionID,
+            formattedExcStartDate,
+            formattedExcEndDate,
+            req.body.employeeData.exceptionComments || null,
+            ...camposAuditoriaADD(req)
+          ]
+        );
+      }
+
+      await syncEmployeeExceptionFromHistory(employeeID, req);
+    }
+
+    const [employee] = await db.query(
+      `SELECT
+          e.employeeID, e.codeEmployee, concat(firstName, " ", middleName, " ", lastName, " ", secondLastName) fullName,
+          dep.departmentName, j.jobName, e.incapacitated, shi.shiftName, e.isActive, e.docNumber, if (e.isActive, 'ACTIVO', 'INACTIVO') isActive
+        FROM employees_emp e
+              INNER JOIN division_emp di on di.divisionID = e.divisionID
+              INNER JOIN area_emp a on a.areaID = e.areaID
+              INNER JOIN department_emp dep on dep.departmentID = e.departmentID
+              INNER JOIN shifts_emp shi on shi.shiftID = e.shiftID
+              INNER JOIN jobs_emp j on j.jobID = e.jobID
+              where e.employeeID = ${employeeID}
+        ORDER BY e.employeeID asc;`
+    );
+
+    //Agregar registro de historico del empleado
+    res.status(201).json(...employee);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error" });
+  }
+};
+
+exports.disabledEmployee = async (req, res) => {
+  try {
+    const [result] = await db.query(
+      `INSERT INTO h_dismissal_emp (dateDismissal, dismissalTypeID, employeeID, comment, 
+        createdDate, createdBy)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        dayjs(req.body.dateDismissal).format("YYYY-MM-DD"),
+        req.body.dismissalTypeID,
+        req.body.employeeID,
+        req.body.comment,
+        camposAuditoriaADD(req),
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ message: "Empleado no encontrado" });
+    }
+    // Actualizar el estado del empleado a inactivo
+    await db.query(
+      `UPDATE employees_emp SET isActive = 0, endDate = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?`,
+      [
+        dayjs(req.body.dateDismissal).format("YYYY-MM-DD"),
+        ...camposAuditoriaUPDATE(req),
+        req.body.employeeID,
+      ]
+    );
+
+    const fechaDismissal = dayjs(req.body.dateDismissal).format("YYYY-MM-DD");
+
+    await db.query(
+      `UPDATE h_assigmentshift_emp
+       SET endDate = ?, updatedDate = ?, updatedBy = ?
+       WHERE employeeID = ?
+         AND DATE(startDate) <= ?
+         AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+      [
+        fechaDismissal,
+        ...camposAuditoriaUPDATE(req),
+        req.body.employeeID,
+        fechaDismissal,
+        fechaDismissal,
+      ]
+    );
+
+    await db.query(
+      `UPDATE h_assigmentexception_emp
+       SET endDate = ?, updatedDate = ?, updatedBy = ?
+       WHERE employeeID = ?
+         AND DATE(startDate) <= ?
+         AND (endDate IS NULL OR DATE(endDate) >= ?)`,
+      [
+        fechaDismissal,
+        ...camposAuditoriaUPDATE(req),
+        req.body.employeeID,
+        fechaDismissal,
+        fechaDismissal,
+        fechaDismissal,
+      ]
+    );
+
+    // Eliminar del la tabla de employeelines_emp al empleado deshabilitado
+    await db.query(
+      `DELETE FROM employeelines_emp WHERE employeeID = ?`,
+      [req.body.employeeID]
+    );
+
+    res.status(200).json({ message: "Empleado deshabilitado" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al deshabilitar el empleado" });
+  }
+};
+
+exports.uploadPhoto = (req, res) => {
+  upload.single("image")(req, res, async (err) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Error al subir la foto" });
+    }
+
+    // Guardar la ruta de la foto en la base de datos
+    const photoPath = req.file.filename;
+    const employeeID = req.params.employeeID;
+    try {
+      await db.query(
+        "UPDATE employees_emp SET photoUrl = ? WHERE employeeID = ?",
+        [photoPath, employeeID]
+      );
+      res.status(200).json({ message: "Foto subida correctamente" });
+    } catch (error) {
+      console.error(error);
+      res
+        .status(500)
+        .json({ message: "Error al guardar la foto en la base de datos" });
+    }
+  });
+};
+
+////// HIJOS DE EMPLEADOS //////
+exports.addChild = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    birthDate,
+    birthCert,
+    genderID,
+  } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO children_emp (
+          firstName, middleName, lastName, secondLastName, birthDate, birthCert,
+          genderID, employeeID, createdDate, createdBy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        dayjs(birthDate).format("YYYY-MM-DD"),
+        birthCert,
+        genderID,
+        req.params.employeeID,
+        camposAuditoriaADD(req),
+      ]
+    );
+    res.status(201).json({
+      childrenID: result.insertId,
+      message: "Hijo creado correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al crear el hijo" });
+  }
+};
+exports.updateChild = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    birthDate,
+    birthCert,
+    genderID,
+  } = req.body;
+  if (!isValidNumber(req.params.childrenID)) {
+    return res.status(500).json({ message: "ID de hijo inválido" });
+  }
+  try {
+    //Actualizar
+    await db.query(
+      `UPDATE children_emp SET
+          firstName = ?,
+          middleName = ?,
+          lastName = ?,
+          secondLastName = ?,
+          birthDate = ?,
+          birthCert = ?,
+          genderID = ?,
+          updatedDate = ?,
+          updatedBy = ?
+        WHERE childrenID = ?`,
+      [
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        dayjs(birthDate).format("YYYY-MM-DD"),
+        birthCert,
+        genderID,
+        ...camposAuditoriaUPDATE(req),
+        req.params.childrenID,
+      ]
+    );
+    res.status(200).json({ message: "Hijo actualizado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al actualizar el hijo" });
+  }
+};
+
+exports.deleteChild = async (req, res) => {
+  const { childrenID } = req.params;
+  try {
+    await db.query("DELETE FROM children_emp WHERE childrenID = ?", [
+      childrenID,
+    ]);
+    res.json({ message: "Hijo eliminado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al eliminar el hijo" });
+  }
+};
+
+///// INFORMACION FAMILIAR DE EMPLEADOS //////
+exports.addFamilyInfo = async (req, res) => {
+  const {
+    relativesTypeID,
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    age,
+  } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO familyinformation_emp (
+          relativesTypeID, firstName, middleName, lastName, secondLastName, age,
+          employeeID, createdDate, createdBy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        relativesTypeID,
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        parseInt(age) || null,
+        req.params.employeeID,
+        camposAuditoriaADD(req),
+      ]
+    );
+    res.status(201).json({
+      familyInfoID: result.insertId,
+      message: "Información familiar creada correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al crear la información familiar" });
+  }
+};
+exports.updateFamilyInfo = async (req, res) => {
+  const {
+    relativesTypeID,
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    age,
+  } = req.body;
+  if (!isValidNumber(req.params.familyInfoID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de información familiar inválido" });
+  }
+  try {
+    //Actualizar
+    await db.query(
+      `UPDATE familyinformation_emp SET
+          relativesTypeID = ?,
+          firstName = ?,
+          middleName = ?,
+          lastName = ?,
+          secondLastName = ?,
+          age = ?,
+          updatedDate = ?,
+          updatedBy = ?
+        WHERE familyInfoID = ?`,
+      [
+        relativesTypeID,
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        parseInt(age) || null,
+        ...camposAuditoriaUPDATE(req),
+        req.params.familyInfoID,
+      ]
+    );
+    res
+      .status(200)
+      .json({ message: "Información familiar actualizada correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar la información familiar" });
+  }
+};
+exports.deleteFamilyInfo = async (req, res) => {
+  const { familyInfoID } = req.params;
+  if (!isValidNumber(familyInfoID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de información familiar inválido" });
+  }
+  try {
+    await db.query("DELETE FROM familyinformation_emp WHERE familyInfoID = ?", [
+      familyInfoID,
+    ]);
+    res.json({ message: "Información familiar eliminada correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al eliminar la información familiar" });
+  }
+};
+
+///// CONTACTOS DE EMERGENCIA //////
+exports.addEContact = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    stateID,
+    cityID,
+    sectorID,
+    suburbID,
+    relativesTypeID,
+    phoneNumber,
+  } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO econtacts_emp (
+          firstName, middleName, lastName, secondLastName, stateID, cityID,
+          sectorID, suburbID, relativesTypeID, phoneNumber,
+          employeeID, createdDate, createdBy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        stateID,
+        cityID,
+        sectorID,
+        suburbID,
+        relativesTypeID,
+        phoneNumber,
+        req.params.employeeID,
+        camposAuditoriaADD(req),
+      ]
+    );
+    res.status(201).json({
+      econtactID: result.insertId,
+      message: "Contacto de emergencia creado correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al crear el contacto de emergencia" });
+  }
+};
+exports.updateEContact = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    stateID,
+    cityID,
+    sectorID,
+    suburbID,
+    relativesTypeID,
+    phoneNumber,
+  } = req.body;
+
+  if (!isValidNumber(req.params.econtactID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de contacto de emergencia inválido" });
+  }
+  try {
+    await db.query(
+      `UPDATE econtacts_emp SET
+          firstName = ?, middleName = ?, lastName = ?,
+          secondLastName = ?, stateID = ?, cityID = ?,
+          sectorID = ?, suburbID = ?, relativesTypeID = ?,
+          phoneNumber = ?, updatedDate = ?, updatedBy = ?
+        WHERE econtactID = ?`,
+      [
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        stateID,
+        cityID,
+        sectorID,
+        suburbID,
+        relativesTypeID,
+        phoneNumber,
+        ...camposAuditoriaUPDATE(req),
+        req.params.econtactID,
+      ]
+    );
+    res
+      .status(200)
+      .json({ message: "Contacto de emergencia actualizado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar el contacto de emergencia" });
+  }
+};
+exports.deleteEContact = async (req, res) => {
+  const { econtactID } = req.params;
+  if (!isValidNumber(econtactID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de contacto de emergencia inválido" });
+  }
+  try {
+    await db.query("DELETE FROM econtacts_emp WHERE econtactID = ?", [
+      econtactID,
+    ]);
+    res
+      .status(200)
+      .json({ message: "Contacto de emergencia eliminado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al eliminar el contacto de emergencia" });
+  }
+};
+
+///// AUXILIARES DE EMPLEADOS //////
+exports.addAuxRelative = async (req, res) => {
+  const { relativesTypeID, employeeID } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO auxrelative_emp (relativesTypeID, newEmployee, employeeID, createdDate, createdBy) VALUES (?, ?, ?, ?, ?)`,
+      [
+        relativesTypeID,
+        parseInt(req.params.employeeID),
+        employeeID,
+        ...camposAuditoriaADD(req),
+      ]
+    );
+    res.status(201).json({
+      auxRelativeID: result.insertId,
+      message: "Familiar auxiliar creado correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al crear el familiar auxiliar" });
+  }
+};
+exports.updateAuxRelative = async (req, res) => {
+  const { relativesTypeID, employeeID } = req.body;
+
+  if (!isValidNumber(req.params.auxRelativeID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de familiar auxiliar inválido" });
+  }
+  try {
+    await db.query(
+      `UPDATE auxrelative_emp SET
+          relativesTypeID = ?, employeeID = ?,
+          updatedDate = ?, updatedBy = ?
+        WHERE auxRelativeID = ?`,
+      [
+        relativesTypeID,
+        employeeID,
+        ...camposAuditoriaUPDATE(req),
+        req.params.auxRelativeID,
+      ]
+    );
+    res.json({ message: "Familiar auxiliar actualizado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar el familiar auxiliar" });
+  }
+};
+exports.deleteAuxRelative = async (req, res) => {
+  const { auxRelativeID } = req.params;
+  if (!isValidNumber(auxRelativeID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de familiar auxiliar inválido" });
+  }
+  try {
+    await db.query("DELETE FROM auxrelative_emp WHERE auxRelativeID = ?", [
+      auxRelativeID,
+    ]);
+    res.json({ message: "Familiar auxiliar eliminado correctamente" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al eliminar el familiar auxiliar" });
+  }
+};
+
+//Eliminar varios familiares auxiliares
+exports.deleteAuxRelativeByEmployee = async (req, res) => {
+  const { employeeID } = req.params;
+  if (!isValidNumber(employeeID)) {
+    return res.status(500).json({ message: "ID de empleado inválido" });
+  }
+  try {
+    await db.query("DELETE FROM auxrelative_emp WHERE newEmployee = ?", [
+      employeeID,
+    ]);
+    res
+      .status(200)
+      .json({ message: "Familiares auxiliares eliminados correctamente" });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al eliminar los familiares auxiliares" });
+  }
+};
+
+///// INFORMACION DE BENEFICIARIOS //////
+exports.addBeneficiaryInfo = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    percentage,
+    relativesTypeID,
+    phoneNumber,
+  } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO beneficiaries_emp (
+          firstName, middleName, lastName, secondLastName, percentage,
+          relativesTypeID, phoneNumber, employeeID,
+          createdDate, createdBy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        formatNamePart(firstName),
+        formatNamePart(middleName),
+        formatNamePart(lastName),
+        formatNamePart(secondLastName),
+        parseInt(percentage),
+        relativesTypeID,
+        phoneNumber,
+        req.params.employeeID,
+        camposAuditoriaADD(req),
+      ]
+    );
+    res.status(201).json({
+      beneficiaryID: result.insertId,
+      message: "Información del beneficiario creada correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al crear la información del beneficiario" });
+  }
+};
+exports.updateBeneficiaryInfo = async (req, res) => {
+  const {
+    firstName,
+    middleName,
+    lastName,
+    secondLastName,
+    percentage,
+    relativesTypeID,
+    phoneNumber,
+  } = req.body;
+
+  if (!isValidNumber(req.params.beneficiaryID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de información del beneficiario inválido" });
+  }
+  try {
+    await db.query(
+      `UPDATE beneficiaries_emp SET
+          firstName = ?, middleName = ?, lastName = ?,
+          secondLastName = ?, percentage = ?, relativesTypeID = ?,
+          phoneNumber = ?, updatedDate = ?, updatedBy = ?
+        WHERE beneficiaryID = ?`,
+      [
+        firstName,
+        middleName,
+        lastName,
+        secondLastName,
+        percentage,
+        relativesTypeID,
+        phoneNumber,
+        ...camposAuditoriaUPDATE(req),
+        req.params.beneficiaryID,
+      ]
+    );
+    res.status(200).json({
+      message: "Información del beneficiario actualizada correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al actualizar la información del beneficiario" });
+  }
+};
+exports.deleteBeneficiaryInfo = async (req, res) => {
+  const { beneficiaryID } = req.params;
+  if (!isValidNumber(beneficiaryID)) {
+    return res
+      .status(500)
+      .json({ message: "ID de información del beneficiario inválido" });
+  }
+  try {
+    await db.query("DELETE FROM beneficiaries_emp WHERE beneficiaryID = ?", [
+      beneficiaryID,
+    ]);
+    res.status(200).json({
+      message: "Información del beneficiario eliminada correctamente",
+    });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ message: "Error al eliminar la información del beneficiario" });
+  }
+};
+
+//Obtener todas las excepciones de empleados
+exports.getExceptions = async (req, res) => {
+  try {
+    const [exceptions] = await db.query(
+      "SELECT exceptionID, exceptionName FROM exceptions_emp"
+    );
+    res.status(200).json(exceptions);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Error al obtener las excepciones" });
+  }
+};
+
+//Actualizar excepción del empleado
+exports.updateEmployeeException = async (req, res) => {
+  try {
+    const { employeeID } = req.params;
+    // const { exceptionID } = req.body;
+    // de lo nuevo cambiar linea 1744 por esta
+    const { exceptionID, startDate, endDate, comments } = req.body;
+
+    // Validar que los IDs son números válidos
+    if (!isValidNumber(employeeID) || !isValidNumber(exceptionID)) {
+      return res
+        .status(400)
+        .json({ message: "ID de empleado o excepción no válido." });
+    }
+//de lo nuevo 
+    if (!startDate) {
+      return res.status(400).json({ message: "La fecha de inicio es obligatoria" });
+    }
+
+    const formattedStartDate = dayjs(startDate).format("YYYY-MM-DD");
+    const formattedEndDate = endDate ? dayjs(endDate).format("YYYY-MM-DD") : null;
+    // AND (endDate IS NULL OR DATE(endDate) >= ?) aqui se cierran todas las excepciones abiertas y cerradas 
+    //Cerrar ÚNICAMENTE las excepciones previas que estén ABIERTAS (endDate IS NULL) un día antes del inicio de la nueva excepción
+    await db.query(
+      `UPDATE h_assigmentexception_emp
+       SET endDate = DATE_SUB(?, INTERVAL 1 DAY)
+       WHERE employeeID = ?
+         AND DATE(startDate) < ?
+         AND endDate IS NULL 
+         AND exceptionID <> ?`,
+      [formattedStartDate, employeeID, formattedStartDate, exceptionID]
+    );
+
+    const overlapCheck = await validateNoExceptionOverlap(
+      employeeID,
+      formattedStartDate,
+      formattedEndDate
+    );
+
+    if (!overlapCheck.valid) {
+      return res.status(409).json({ message: overlapCheck.message });
+    }
+
+    const [result] = await db.query(
+      "UPDATE employees_emp SET exceptionID = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?",
+      [exceptionID, ...camposAuditoriaUPDATE(req), employeeID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Empleado no encontrado." });
+    }
+//de lo nuevo 
+    await db.query(
+      `INSERT INTO h_assigmentexception_emp
+        (employeeID, exceptionID, startDate, endDate, comments, createdDate, createdBy)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        employeeID,
+        exceptionID,
+        formattedStartDate,
+        formattedEndDate,
+        comments || null,
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+     const [excRows] = await db.query(
+      `SELECT exceptionName FROM exceptions_emp WHERE exceptionID=?`,
+      [exceptionID]
+    );
+    if (excRows.length > 0 && excRows[0].exceptionName.toLowerCase().includes("lactancia") && formattedEndDate) {
+      await syncLactationFollowUp(employeeID, null, formattedEndDate, req);
+    }
+
+    res
+      .status(200)
+      .json({ message: "Excepción del empleado actualizada correctamente." });
+  } catch (error) {
+    console.error("Error al actualizar la excepción del empleado:", error);
+    res
+      .status(500)
+      .json({ message: "Error interno al actualizar la excepción." });
+  }
+};
+//de lo nuevo 
+async function validateNoExceptionOverlap(employeeID, startDate, endDate, excludeID = null) {
+  if (endDate && startDate > endDate) {
+    return {
+      valid: false,
+      message: "La fecha de inicio no puede ser mayor que la fecha final",
+    };
+  }
+
+  const [rows] = await db.query(
+    `SELECT hassignmentexceptionID
+     FROM h_assigmentexception_emp
+     WHERE employeeID = ?
+       AND DATE(startDate) <= ?
+       AND (endDate IS NULL OR DATE(endDate) >= ?)
+       ${excludeID ? "AND hassignmentexceptionID <> ?" : ""}
+     LIMIT 1`,
+    [
+      employeeID,
+      endDate || "9999-12-31",
+      startDate,
+      ...(excludeID ? [excludeID] : []),
+    ]
+  );
+
+  if (rows.length > 0) {
+    return {
+      valid: false,
+      message: "El empleado ya tiene una excepción programada en ese rango de fechas",
+    };
+  }
+
+  return { valid: true };
+}
+
+async function syncEmployeeExceptionFromHistory(employeeID, req = null) {
+  const today = dayjs().format("YYYY-MM-DD");
+  const [historyRows] = await db.query(
+    `SELECT exceptionID
+     FROM h_assigmentexception_emp
+     WHERE employeeID = ?
+       AND DATE(?) >= DATE(startDate)
+       AND (endDate IS NULL OR DATE(?) <= DATE(endDate))
+     ORDER BY startDate DESC, hassignmentexceptionID DESC
+     LIMIT 1`,
+    [employeeID, today, today]
+  );
+
+  const exceptionID = historyRows[0]?.exceptionID ?? 3;
+  const auditValues = req
+    ? camposAuditoriaUPDATE(req)
+    : [dayjs().format("YYYY-MM-DD HH:mm:ss"), 0];
+
+  await db.query(
+    "UPDATE employees_emp SET exceptionID = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?",
+    [exceptionID, ...auditValues, employeeID]
+  );
+}
+
+async function syncLactationFollowUp(employeeID, previousEndDate, nextEndDate, req) {
+  const previousStartDate = previousEndDate
+    ? dayjs(previousEndDate).add(1, "day").format("YYYY-MM-DD")
+    : null;
+  const nextStartDate = nextEndDate
+    ? dayjs(nextEndDate).add(1, "day").format("YYYY-MM-DD")
+    : null;
+
+  if (!previousStartDate && !nextStartDate) {
+    return;
+  }
+
+  const [noExceptionRows] = await db.query(
+    `SELECT exceptionID
+     FROM exceptions_emp
+     WHERE LOWER(exceptionName) LIKE '%sin excepciones%'
+     LIMIT 1`
+  );
+
+  if (noExceptionRows.length === 0) {
+    throw new Error("No se encontró la excepción 'Sin excepciones'.");
+  }
+
+  const noExceptionID = noExceptionRows[0].exceptionID;
+  const auditValues = camposAuditoriaUPDATE(req);
+
+  if (previousStartDate && previousStartDate !== nextStartDate) {
+    await db.query(
+      `DELETE FROM h_assigmentexception_emp
+       WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?`,
+      [employeeID, noExceptionID, previousStartDate]
+    );
+  }
+
+  if (nextStartDate) {
+    const [existingFollowUp] = await db.query(
+      `SELECT hassignmentexceptionID
+       FROM h_assigmentexception_emp
+       WHERE employeeID = ? AND exceptionID = ? AND DATE(startDate) = ?
+       ORDER BY startDate DESC
+       LIMIT 1`,
+     [employeeID, noExceptionID, dayjs(nextStartDate).subtract(7, "day").format("YYYY-MM-DD")]
+    );
+
+    if (existingFollowUp.length > 0) {
+      await db.query(
+        `UPDATE h_assigmentexception_emp
+         SET endDate = NULL, updatedDate = ?, updatedBy = ?
+         WHERE hassignmentexceptionID = ?`,
+        [...auditValues, existingFollowUp[0].hassignmentexceptionID]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO h_assigmentexception_emp
+         (employeeID, exceptionID, startDate, endDate, comments, createdDate, createdBy)
+         VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+        [
+          employeeID,
+          noExceptionID,
+          nextStartDate,
+          null,
+          ...camposAuditoriaADD(req),
+        ]
+      );
+    }
+  }
+}
+
+
+exports.getShiftsChanges = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+
+    const [shiftsChanges] = await db.query(`
+      select shiftID , shiftName from shifts_emp
+      `);
+
+    res.status(200).json(shiftsChanges);
+  } catch (error) {
+
+    console.error(error);
+    res.status(500).json({ message: t("shiftemplooyeenotfound", language) });
+  }
+}
+
+async function validateNoShiftOverlap(employeeID, startDate, endDate, excludeID = null, previousShiftID = null) {
+  const normalizedStart = dayjs(startDate).format("YYYY-MM-DD");
+  const normalizedEnd = endDate ? dayjs(endDate).format("YYYY-MM-DD") : null;
+
+  if (normalizedEnd && normalizedStart > normalizedEnd) {
+    return {
+      valid: false,
+      message: "La fecha de inicio no puede ser mayor que la fecha final",
+    };
+  }
+
+  const [rows] = await db.query(
+    `SELECT hassigmentshiftID
+     FROM h_assigmentshift_emp
+     WHERE employeeID = ?
+       AND DATE(startDate) <= ?
+       AND (endDate IS NULL OR DATE(endDate) >= ?)
+       ${excludeID ? "AND hassigmentshiftID <> ?" : ""}
+       ${previousShiftID ? "AND NOT (DATE(startDate) < ? AND shiftID <> ?)" : ""}
+     LIMIT 1`,
+    [
+      employeeID,
+      normalizedEnd || "9999-12-31",
+      normalizedStart,
+      ...(excludeID ? [excludeID] : []),
+      ...(previousShiftID ? [normalizedStart, previousShiftID] : []),
+    ]
+  );
+
+  if (rows.length > 0) {
+    return {
+      valid: false,
+      message: "El empleado ya tiene un turno programado en ese rango de fechas",
+    };
+  }
+
+  return { valid: true };
+}
+
+async function syncEmployeeShiftFromHistory(employeeID, req = null) {
+  const todayStr = dayjs().format("YYYY-MM-DD");
+
+  const [historyRows] = await db.query(
+    `SELECT hs.shiftID
+     FROM h_assigmentshift_emp hs
+     WHERE hs.employeeID = ?
+       AND DATE(?) >= DATE(hs.startDate)
+       AND (hs.endDate IS NULL OR DATE(?) <= DATE(hs.endDate))
+     ORDER BY hs.startDate DESC, hs.hassigmentshiftID DESC
+     LIMIT 1`,
+    [employeeID, todayStr, todayStr]
+  );
+
+  const effectiveShiftID = historyRows[0]?.shiftID ?? null;
+
+  if (effectiveShiftID !== null) {
+    const auditValues = req ? camposAuditoriaUPDATE(req) : [dayjs().format("YYYY-MM-DD HH:mm:ss"), 0];
+    await db.query(
+      "UPDATE employees_emp SET shiftID = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?",
+      [effectiveShiftID, ...auditValues, employeeID]
+    );
+    return effectiveShiftID;
+  }
+
+  const [employeeRow] = await db.query(
+    "SELECT shiftID FROM employees_emp WHERE employeeID = ? LIMIT 1",
+    [employeeID]
+  );
+
+  if (employeeRow && employeeRow[0]) {
+    const auditValues = req ? camposAuditoriaUPDATE(req) : [dayjs().format("YYYY-MM-DD HH:mm:ss"), 0];
+    await db.query(
+      "UPDATE employees_emp SET shiftID = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?",
+      [employeeRow[0].shiftID, ...auditValues, employeeID]
+    );
+    return employeeRow[0].shiftID;
+  }
+
+  return null;
+}
+
+exports.updateEmployeeShift = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  //para programacin de turnos
+  // const { shiftID, startDate, endDate, comments } = req.body;
+  try {
+    const { employeeID } = req.params;
+    const { shiftID, startDate, endDate, comments } = req.body;
+
+    if (!isValidNumber(employeeID) || !isValidNumber(shiftID)) {
+      return res
+        .status(400)
+        .json({ message: t("shiftemplooyeenotfound", language) });
+    }
+//descomentar para programacin de turnos
+    if (!startDate) {
+      return res
+        .status(400)
+        .json({ message: "La fecha de inicio es obligatoria" });
+    }
+
+    // Formateamos las fechas para tipo DATETIME
+    const formattedStartDate = dayjs(startDate).format("YYYY-MM-DD");
+    const formattedEndDate = endDate ? dayjs(endDate).format("YYYY-MM-DD") : null;
+
+    const overlapCheck = await validateNoShiftOverlap(
+      employeeID,
+      formattedStartDate,
+      formattedEndDate,
+      null,
+      shiftID
+    );
+
+    if (!overlapCheck.valid) {
+      return res.status(409).json({ message: overlapCheck.message });
+    }
+
+    // 1. Actualizar la asignación del turno actual en el empleado
+    const [result] = await db.query(
+      "UPDATE employees_emp SET shiftID = ?, updatedDate = ?, updatedBy = ? WHERE employeeID = ?",
+      [shiftID, ...camposAuditoriaUPDATE(req), employeeID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: t("employeenotfound", language) });
+    }
+
+    // 2. Cerrar cualquier asignación anterior que siga vigente al nuevo inicio
+    // Se considera válido si está activa antes del nuevo inicio y no termina antes de ese punto.
+    await db.query(
+      `UPDATE h_assigmentshift_emp
+       SET endDate = DATE_SUB(?, INTERVAL 1 DAY)
+       WHERE employeeID = ?
+         AND DATE(startDate) < ?
+         AND (endDate IS NULL OR DATE(endDate) >= ?)
+         AND shiftID <> ?`,
+      [formattedStartDate, employeeID, formattedStartDate, formattedStartDate, shiftID]
+    );
+
+    // 3. Insertar el nuevo rango de turno en el histórico
+    await db.query(
+      `INSERT INTO h_assigmentshift_emp 
+        (employeeID, shiftID, startDate, endDate, comments, createdDate, createdBy) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        employeeID,
+        shiftID,
+        formattedStartDate,
+        formattedEndDate,
+        comments || null,
+        ...camposAuditoriaADD(req),
+      ]
+    );
+
+    await syncEmployeeShiftFromHistory(employeeID, req);
+
+    res.status(200).json({ message: t("updateSuccess", language) });
+  } catch (error) {
+    console.error("Error al actualizar turno del empleado:", error);
+    res.status(500).json({ message: t("updateError", language) });
+  }
+};
+
+//nueva pantalla para ver el historico de cambios de turno
+exports.getShiftChangesHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    const { employeeID, startDate, endDate, searchTerm } = req.query;
+
+    const filters = [];
+    const params = [];
+
+    if (employeeID) {
+      filters.push("h.employeeID = ?");
+      params.push(employeeID);
+    }
+
+    if (startDate && endDate) {
+      filters.push(
+        "h.startDate <= ? AND (h.endDate IS NULL OR h.endDate >= ?)"
+      );
+      params.push(
+        dayjs(endDate).endOf("day").format("YYYY-MM-DD"),
+        dayjs(startDate).startOf("day").format("YYYY-MM-DD")
+      );
+    }
+
+    if (searchTerm) {
+      filters.push(
+        "(e.codeEmployee LIKE ? OR CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) LIKE ?)"
+      );
+      params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const baseQuery = `
+      FROM h_assigmentshift_emp h
+      INNER JOIN employees_emp e ON e.employeeID = h.employeeID
+      INNER JOIN shifts_emp s ON s.shiftID = h.shiftID
+      ${whereClause}
+    `;
+
+    // Conteo total
+    const [[{ total }]] = await db.query(
+      `SELECT COUNT(*) AS total ${baseQuery}`,
+      params
+    );
+
+    // Consulta de registros con el PK real
+    const [history] = await db.query(
+      `SELECT 
+          h.hassigmentshiftID,
+          h.employeeID,
+          e.codeEmployee,
+          CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName,
+          s.shiftID,
+          s.shiftName,
+          h.startDate,
+          h.endDate,
+          h.comments,
+          h.createdDate,
+          h.createdBy
+       ${baseQuery}
+       ORDER BY h.hassigmentshiftID DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      data: history,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("Error al obtener histórico de turnos:", error);
+    res.status(500).json({ message: t("getError", language) || "Error al obtener datos" });
+  }
+};
+
+
+
+exports.exportShiftHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+    const { employeeID, startDate, endDate, searchTerm } = req.query;
+
+    const filters = [];
+    const params = [];
+
+    if (employeeID) {
+      filters.push("h.employeeID = ?");
+      params.push(employeeID);
+    }
+
+    if (startDate && endDate) {
+      filters.push("h.startDate <= ? AND (h.endDate IS NULL OR h.endDate >= ?)");
+      params.push(
+        dayjs(endDate).endOf("day").format("YYYY-MM-DD"),
+        dayjs(startDate).startOf("day").format("YYYY-MM-DD")
+      );
+    }
+
+    if (searchTerm) {
+      filters.push(
+        "(e.codeEmployee LIKE ? OR CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) LIKE ?)"
+      );
+      params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const [history] = await db.query(
+      `SELECT 
+          h.hassigmentshiftID,
+          e.codeEmployee,
+          CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName,
+          s.shiftName,
+          h.startDate,
+          h.endDate,
+          h.comments,
+          h.createdDate
+       FROM h_assigmentshift_emp h
+       INNER JOIN employees_emp e ON e.employeeID = h.employeeID
+       INNER JOIN shifts_emp s ON s.shiftID = h.shiftID
+       ${whereClause}
+       ORDER BY h.hassigmentshiftID DESC`,
+      params
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Historial de Programación");
+
+    sheet.columns = [
+      { header: "Código", key: "codeEmployee", width: 12 },
+      { header: "Nombre Completo", key: "fullName", width: 35 },
+      { header: "Turno", key: "shiftName", width: 20 },
+      { header: "Fecha Inicio", key: "startDate", width: 15 },
+      { header: "Fecha Fin", key: "endDate", width: 15 },
+      { header: "Comentarios", key: "comments", width: 30 },
+      { header: "Fecha Registro", key: "createdDate", width: 20 },
+    ];
+
+    // Estilo del encabezado
+    sheet.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF1976D2" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+
+    // Agregar filas de datos
+    history.forEach((row) => {
+      sheet.addRow({
+        codeEmployee: row.codeEmployee || "",
+        fullName: row.fullName || "",
+        shiftName: row.shiftName || "",
+        startDate: row.startDate ? dayjs(row.startDate).format("YYYY-MM-DD") : "",
+        endDate: row.endDate ? dayjs(row.endDate).format("YYYY-MM-DD") : "",
+        comments: row.comments || "",
+        createdDate: row.createdDate ? dayjs(row.createdDate).format("YYYY-MM-DD HH:mm") : "",
+      });
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="Historial_Programacion_Turno_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar histórico de turnos:", error);
+    res.status(500).json({ message: "Error al exportar los datos" });
+  }
+};
+
+
+// Actualizar un registro del historial de turnos
+exports.updateShiftHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  const { hassigmentshiftID } = req.params;
+  const { shiftID, startDate, endDate, comments } = req.body;
+
+  if (!isValidNumber(hassigmentshiftID) || !isValidNumber(shiftID)) {
+    return res.status(400).json({ message: "IDs de historial o turno no válidos" });
+  }
+
+  if (!startDate) {
+    return res.status(400).json({ message: "La fecha de inicio es obligatoria" });
+  }
+
+  try {
+    const formattedStartDate = dayjs(startDate).format("YYYY-MM-DD");
+    const formattedEndDate = endDate ? dayjs(endDate).format("YYYY-MM-DD") : null;
+
+    const [existingRecord] = await db.query(
+      "SELECT employeeID FROM h_assigmentshift_emp WHERE hassigmentshiftID = ? LIMIT 1",
+      [hassigmentshiftID]
+    );
+
+    if (!existingRecord[0]) {
+      return res.status(404).json({ message: "Registro no encontrado" });
+    }
+
+    const overlapCheck = await validateNoShiftOverlap(
+      existingRecord[0].employeeID,
+      formattedStartDate,
+      formattedEndDate,
+      hassigmentshiftID
+    );
+
+    if (!overlapCheck.valid) {
+      return res.status(409).json({ message: overlapCheck.message });
+    }
+
+    const [result] = await db.query(
+      `UPDATE h_assigmentshift_emp 
+       SET shiftID = ?, startDate = ?, endDate = ?, comments = ?, updatedDate = ?, updatedBy = ?
+       WHERE hassigmentshiftID = ?`,
+      [
+        shiftID,
+        formattedStartDate,
+        formattedEndDate,
+        comments || null,
+        ...camposAuditoriaUPDATE(req),
+        hassigmentshiftID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Registro no encontrado" });
+    }
+
+    await syncEmployeeShiftFromHistory(existingRecord[0].employeeID, req);
+
+    return res.status(200).json({ message: t("updateSuccess", language) || "Registro actualizado correctamente" });
+  } catch (error) {
+    console.error("Error al actualizar el registro de turno:", error);
+    return res.status(500).json({ message: "Error interno al actualizar el historial de turno" });
+  }
+};
+
+// Eliminar un registro del historial de turnos
+exports.deleteShiftHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  const { hassigmentshiftID } = req.params;
+
+  if (!isValidNumber(hassigmentshiftID)) {
+    return res.status(400).json({ message: "ID de historial de turno inválido" });
+  }
+
+  try {
+    const [recordToDelete] = await db.query(
+      "SELECT employeeID FROM h_assigmentshift_emp WHERE hassigmentshiftID = ? LIMIT 1",
+      [hassigmentshiftID]
+    );
+
+    if (!recordToDelete || !recordToDelete[0]) {
+      return res.status(404).json({ message: "Registro de turno no encontrado" });
+    }
+
+    const employeeID = recordToDelete[0].employeeID;
+
+    const [result] = await db.query(
+      "DELETE FROM h_assigmentshift_emp WHERE hassigmentshiftID = ?",
+      [hassigmentshiftID]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Registro de turno no encontrado" });
+    }
+
+    await syncEmployeeShiftFromHistory(employeeID, req);
+
+    return res.status(200).json({ message: "Registro de turno eliminado correctamente" });
+  } catch (error) {
+    console.error("Error al eliminar el registro del turno:", error);
+    return res.status(500).json({ message: "Error interno al eliminar el turno del historial" });
+  }
+};
+
+const obtenerDiasDisponibles = (hireDate, vacacionesTomadas) => {
+  const hoy = new Date();
+  const ingreso = new Date(hireDate);
+
+  // Antigüedad total en años (decimal)
+  const antiguedadAnios = (hoy - ingreso) / (1000 * 60 * 60 * 24 * 365);
+
+  // Función auxiliar para obtener días según año de antigüedad
+  const diasPorAntiguedad = (anio) => {
+    if (anio < 1) return 10; // Primer año: 10 días
+    else if (anio < 2) return 10;
+    else if (anio < 3) return 12;
+    else if (anio < 4) return 15;
+    else return 20;
+  };
+
+  let totalVacaciones = 0;
+
+  if (antiguedadAnios < 1) {
+    // Para empleados con menos de 1 año: días proporcionales
+    // Ejemplo: 0.52 años = 0.52 * 10 = 5.2 días
+    totalVacaciones = antiguedadAnios * 10;
+  } else {
+    // Años completos trabajados
+    const aniosCompletos = Math.floor(antiguedadAnios);
+
+    // Días totales por años completos
+    let diasCompletos = 0;
+    for (let i = 1; i <= aniosCompletos; i++) {
+      diasCompletos += diasPorAntiguedad(i);
+    }
+
+    // Año actual (incompleto) - solo si hay fracción de año adicional
+    const fraccionAnoActual = antiguedadAnios - aniosCompletos;
+    if (fraccionAnoActual > 0) {
+      const diasDelSiguienteAno = diasPorAntiguedad(aniosCompletos + 1);
+      const diasProporcionales = fraccionAnoActual * diasDelSiguienteAno;
+      totalVacaciones = diasCompletos + diasProporcionales;
+    } else {
+      totalVacaciones = diasCompletos;
+    }
+  }
+
+  return {
+    vacacionesDisponibles:
+      Math.round((totalVacaciones - vacacionesTomadas) * 100) / 100,
+    antiguedad: Math.round(antiguedadAnios * 100) / 100,
+  };
+};
+
+//nueva pantalla para ver la programacion de excepciones
+exports.getExceptionChangesHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    const { employeeID, startDate, endDate, searchTerm } = req.query;
+
+    const filters = [];
+    const params = [];
+
+    if (employeeID) {
+      filters.push("h.employeeID = ?");
+      params.push(employeeID);
+    }
+
+    if (startDate && endDate) {
+      filters.push(
+        "h.startDate <= ? AND (h.endDate IS NULL OR h.endDate >= ?)"
+      );
+      params.push(
+        dayjs(endDate).endOf("day").format("YYYY-MM-DD"),
+        dayjs(startDate).startOf("day").format("YYYY-MM-DD")
+      );
+    }
+
+    if (searchTerm) {
+      filters.push(
+        "(e.codeEmployee LIKE ? OR CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) LIKE ?)"
+      );
+      params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const baseQuery = `
+      FROM h_assigmentexception_emp h
+      INNER JOIN employees_emp e ON e.employeeID = h.employeeID
+      INNER JOIN exceptions_emp ex ON ex.exceptionID = h.exceptionID
+      ${whereClause}
+    `;
+
+    // Conteo total
+    const [[{ total }]] = await db.query(
+      `SELECT COUNT(*) AS total ${baseQuery}`,
+      params
+    );
+
+    // Consulta de registros con el PK real
+    const [history] = await db.query(
+      `SELECT 
+          h.hassignmentexceptionID,
+          h.employeeID,
+          e.codeEmployee,
+          CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName,
+          ex.exceptionID,
+          ex.exceptionName,
+          h.startDate,
+          h.endDate,
+          h.comments,
+          h.createdDate,
+          h.createdBy
+       ${baseQuery}
+       ORDER BY h.hassignmentexceptionID DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      data: history,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("Error al obtener histórico de excepciones:", error);
+    res.status(500).json({ message: t("getError", language) || "Error al obtener datos" });
+  }
+};
+
+exports.exportExceptionHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+
+  try {
+    const { employeeID, startDate, endDate, searchTerm } = req.query;
+    const filters = [];
+    const params = [];
+
+    if (employeeID) {
+      filters.push("h.employeeID = ?");
+      params.push(employeeID);
+    }
+    if (startDate && endDate) {
+      filters.push("h.startDate <= ? AND (h.endDate IS NULL OR h.endDate >= ?)");
+      params.push(
+        dayjs(endDate).endOf("day").format("YYYY-MM-DD"),
+        dayjs(startDate).startOf("day").format("YYYY-MM-DD")
+      );
+    }
+    if (searchTerm) {
+      filters.push(
+        "(e.codeEmployee LIKE ? OR CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) LIKE ?)"
+      );
+      params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const [history] = await db.query(
+      `SELECT
+          e.codeEmployee,
+          CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName,
+          ex.exceptionName,
+          h.startDate,
+          h.endDate,
+          h.comments,
+          h.createdDate
+       FROM h_assigmentexception_emp h
+       INNER JOIN employees_emp e ON e.employeeID = h.employeeID
+       INNER JOIN exceptions_emp ex ON ex.exceptionID = h.exceptionID
+       ${whereClause}
+       ORDER BY h.hassignmentexceptionID DESC`,
+      params
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Historial de Excepciones");
+    sheet.columns = [
+      { header: "Código", key: "codeEmployee", width: 12 },
+      { header: "Nombre Completo", key: "fullName", width: 35 },
+      { header: "Excepción", key: "exceptionName", width: 24 },
+      { header: "Fecha Inicio", key: "startDate", width: 15 },
+      { header: "Fecha Fin", key: "endDate", width: 15 },
+      { header: "Comentarios", key: "comments", width: 30 },
+      { header: "Fecha Registro", key: "createdDate", width: 20 },
+    ];
+
+    sheet.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1976D2" } };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+
+    history.forEach((row) => {
+      sheet.addRow({
+        codeEmployee: row.codeEmployee || "",
+        fullName: row.fullName || "",
+        exceptionName: row.exceptionName || "",
+        startDate: row.startDate ? dayjs(row.startDate).format("YYYY-MM-DD") : "",
+        endDate: row.endDate ? dayjs(row.endDate).format("YYYY-MM-DD") : "",
+        comments: row.comments || "",
+        createdDate: row.createdDate ? dayjs(row.createdDate).format("YYYY-MM-DD HH:mm") : "",
+      });
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="Historial_Programacion_Excepcion_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx"`
+    );
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar histórico de excepciones:", error);
+    res.status(500).json({ message: "Error al exportar los datos" });
+  }
+};
+
+exports.updateExceptionHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  const { hassignmentexceptionID } = req.params;
+  const { exceptionID, startDate, endDate, comments } = req.body;
+
+  if (!isValidNumber(hassignmentexceptionID) || !isValidNumber(exceptionID)) {
+    return res.status(400).json({ message: "IDs de historial o excepción no válidos" });
+  }
+  if (!startDate) {
+    return res.status(400).json({ message: "La fecha de inicio es obligatoria" });
+  }
+
+  try {
+     const formattedStartDate = dayjs(startDate).format("YYYY-MM-DD");
+     const formattedEndDate = endDate ? dayjs(endDate).format("YYYY-MM-DD") : null;
+     
+     const [existingRecord] = await db.query(
+      `SELECT h.employeeID, h.exceptionID, h.endDate, ex.exceptionName
+       FROM h_assigmentexception_emp h
+       LEFT JOIN exceptions_emp ex ON ex.exceptionID = h.exceptionID
+       WHERE h.hassignmentexceptionID = ?
+       LIMIT 1`,
+      [hassignmentexceptionID]
+    );
+
+    if (!existingRecord[0]) {
+      return res.status(404).json({ message: "Registro de excepción no encontrado" });
+    }
+
+    const employeeID = existingRecord[0].employeeID;
+
+    //validacion de bloqueo por maternidad(evitar edicion que proviene de la automatizacion)
+    //CUANDO QUERIA MANEJAR DE FORMA AUTOMATICA Y MANUAL 
+    // const[maternityCheck] = await db.query(
+    //   `SELECT maternityID FROM maternity_emp
+    //    WHERE employeeID = ?
+    //    AND (
+    //    (? BETWEEN startDate AND endDate)OR
+    //    (? BETWEEN startDate AND endDate)OR
+    //    (startDate BETWEEN ? AND ?)
+    //    )`,
+    //    [employeeID, formattedStartDate, formattedEndDate || formattedStartDate, formattedStartDate, formattedEndDate || formattedStartDate]
+    // );
+
+    // if (maternityCheck.length > 0) {
+    //   return res.status(400).json({
+    //     success:false,
+    //     message:"No se puede editar esta excepción porque fue generada automáticamente por la programación de maternidad.",
+    //   });
+    // }
+    
+    const previousWasLactation = (existingRecord[0].exceptionName || "")
+      .toLowerCase()
+      .includes("lactancia");
+
+    // 1. Cerrar las excepciones previas ABIERTAS (endDate IS NULL) un día antes de la fecha modificada
+    await db.query(
+      `UPDATE h_assigmentexception_emp
+       SET endDate = DATE_SUB(?, INTERVAL 1 DAY)
+       WHERE employeeID = ?
+         AND DATE(startDate) < ?
+         AND endDate IS NULL
+         AND hassignmentexceptionID <> ?`,
+      [formattedStartDate, employeeID, formattedStartDate, hassignmentexceptionID]
+    );
+
+    // 2. Validar que no se traslape con excepciones que ya tengan rangos cerrados
+    const overlapCheck = await validateNoExceptionOverlap(
+      employeeID,
+      formattedStartDate,
+      formattedEndDate,
+      hassignmentexceptionID
+    );
+
+    if (!overlapCheck.valid) {
+      return res.status(409).json({ message: overlapCheck.message });
+    }
+
+    // 3. Actualizar el registro de la excepción
+    const [result] = await db.query(
+      `UPDATE h_assigmentexception_emp
+       SET exceptionID = ?, startDate = ?, endDate = ?, comments = ?, updatedDate = ?, updatedBy = ?
+       WHERE hassignmentexceptionID = ?`,
+      [
+        exceptionID,
+        formattedStartDate,
+        formattedEndDate,
+        comments || null,
+        ...camposAuditoriaUPDATE(req),
+        hassignmentexceptionID,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Registro de excepción no encontrado" });
+    }
+
+    const [excRows] = await db.query(
+      `SELECT exceptionName FROM exceptions_emp WHERE exceptionID = ?`,
+      [exceptionID]
+    );
+
+    const nextIsLactation = (excRows[0]?.exceptionName || "")
+      .toLowerCase()
+      .includes("lactancia");
+
+    if (previousWasLactation || nextIsLactation) {
+      await syncLactationFollowUp(
+        employeeID,
+        previousWasLactation ? existingRecord[0].endDate : null,
+        nextIsLactation ? formattedEndDate : null,
+        req
+      );
+    }
+
+    await syncEmployeeExceptionFromHistory(existingRecord[0].employeeID, req);
+
+    return res.status(200).json({ message: "Registro actualizado correctamente" });
+  } catch (error) {
+    console.error("Error al actualizar el registro de excepción:", error);
+    return res.status(500).json({ message: "Error interno al actualizar el historial de excepción" });
+  }
+};
+
+exports.deleteExceptionHistory = async (req, res) => {
+  const language = req.headers["accept-language"] || "es";
+  const { hassignmentexceptionID } = req.params;
+
+  if (!isValidNumber(hassignmentexceptionID)) {
+    return res.status(400).json({ message: "ID de historial de excepción inválido" });
+  }
+
+  try {
+    const [record] = await db.query(
+      `SELECT h.employeeID,h.startDate, h.endDate, ex.exceptionName
+       FROM h_assigmentexception_emp h
+       LEFT JOIN exceptions_emp ex ON ex.exceptionID = h.exceptionID
+       WHERE h.hassignmentexceptionID = ?
+       LIMIT 1`,
+      [hassignmentexceptionID]
+    );
+
+    if (!record[0]) {
+      return res.status(404).json({ message: "Registro de excepción no encontrado" });
+    }
+
+    //validacion de bloqueo por maternidad(evitar eliminacion que proviene de la automatizacion)
+    //CUANDO QUERIA MANEJAR FORMA AUTOMATICA Y MANUAL 
+    // const[maternityCheck] = await db.query(
+    //   `SELECT maternityID FROM maternity_emp
+    //    WHERE employeeID = ?
+    //     AND (
+    //     (? BETWEEN startDate AND endDate)OR
+    //     (? BETWEEN startDate AND endDate)OR
+    //     (startDate BETWEEN ? AND ?)
+    // )`,
+    // [record[0].employeeID, record[0].startDate, record[0].endDate || record[0].startDate, record[0].startDate, record[0].endDate || record[0].startDate]
+    // );
+
+    // if (maternityCheck.length > 0) {
+    //   return res.status(400).json({
+    //     success:false,
+    //     message:"No se puede eliminar esta excepción porque fue generada automáticamente por la programación de maternidad.",
+    //   });
+    // }
+
+    const [result] = await db.query(
+      "DELETE FROM h_assigmentexception_emp WHERE hassignmentexceptionID = ?",
+      [hassignmentexceptionID]
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Registro de excepción no encontrado" });
+    }
+
+    // Al eliminar una excepción, la excepción anterior debe volver a cubrir
+    // el período hasta el inicio de la siguiente; si era la última, queda abierta.
+    const [nextException] = await db.query(
+      `SELECT startDate
+       FROM h_assigmentexception_emp
+       WHERE employeeID = ?
+         AND DATE(startDate) > DATE(?)
+       ORDER BY startDate ASC, hassignmentexceptionID ASC
+       LIMIT 1`,
+      [record[0].employeeID, record[0].startDate]
+    );
+
+    const restoredEndDate = nextException.length > 0
+      ? dayjs(nextException[0].startDate).subtract(1, "day").format("YYYY-MM-DD")
+      : null;
+
+    await db.query(
+      `UPDATE h_assigmentexception_emp
+       SET endDate = ?,
+           updatedDate = NOW(),
+           updatedBy = ?
+       WHERE hassignmentexceptionID = (
+         SELECT hassignmentexceptionID FROM (
+           SELECT previous.hassignmentexceptionID
+           FROM h_assigmentexception_emp previous
+           WHERE previous.employeeID = ?
+             AND DATE(previous.startDate) < DATE(?)
+             AND (
+               previous.endDate IS NULL
+               OR DATE(previous.endDate) = DATE_SUB(DATE(?), INTERVAL 1 DAY)
+             )
+           ORDER BY previous.startDate DESC, previous.hassignmentexceptionID DESC
+           LIMIT 1
+         ) previous_assignment
+       )`,
+      [
+        restoredEndDate,
+        camposAuditoriaUPDATE(req)[1],
+        record[0].employeeID,
+        record[0].startDate,
+        record[0].startDate,
+      ]
+    );
+
+    if ((record[0].exceptionName || "").toLowerCase().includes("lactancia")) {
+      await syncLactationFollowUp(record[0].employeeID, record[0].endDate, null, req);
+    }
+
+    await syncEmployeeExceptionFromHistory(record[0].employeeID, req);
+
+    return res.status(200).json({ message: "Registro de excepción eliminado correctamente" });
+  } catch (error) {
+    console.error("Error al eliminar el registro de excepción:", error);
+    return res.status(500).json({ message: "Error interno al eliminar la excepción del historial" });
+  }
+};
+
+// Obtener vacaciones
+exports.getEmployeeVacations = async (req, res) => {
+  try {
+    const [employee] = await db.query(
+      `
+        SELECT * FROM employees_emp
+        WHERE employeeID = ?;
+      `,
+      [req.params.employeeID]
+    );
+
+    const [vacations] = await db.query(
+      `
+        SELECT vacationID, date FROM vacations_emp
+        WHERE employeeID = ?
+        ORDER BY date ASC;
+      `,
+      [req.params.employeeID]
+    );
+
+    const { hireDate } = employee[0];
+    const { vacacionesDisponibles, antiguedad } = obtenerDiasDisponibles(
+      hireDate,
+      vacations.length
+    );
+
+    res
+      .status(200)
+      .json({ vacacionesDisponibles, vacations, hireDate, antiguedad });
+  } catch (error) {
+    console.error("Error al obtener las vacaciones del empleado:", error);
+    res
+      .status(500)
+      .json({ message: "Error interno al obtener las vacaciones." });
+  }
+};
+
+// exports.getEmployeeVacationInfo = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({ message: t("getError", language) });
+//   }
+// }
+
+exports.getEmployeeVacationInfo = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { from, to } = req.query;
+
+    const vacationsTable = "vacations_emp";
+    const employeesTable = "employees_emp";
+
+    const where = [];
+    const params = [];
+
+    if (from) {
+      where.push(`v.date >= ?`);
+      params.push(from);
+    }
+    if (to) {
+      where.push(`v.date <= ?`);
+      params.push(to);
+    }
+
+    const whereSQL = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        v.employeeID,
+        e.codeEmployee,
+        CONCAT(
+          COALESCE(e.firstName, ''),
+          ' ',
+          COALESCE(e.lastName, '')
+        ) AS fullName,
+        COUNT(*) AS daysTaken,
+        MIN(v.date) AS firstDate,
+        MAX(v.date) AS lastDate,
+        SUM(v.date > CURDATE()) AS pendingCount,
+        (SUM(v.date > CURDATE()) > 0) AS hasPending
+      FROM ${vacationsTable} v
+      INNER JOIN ${employeesTable} e ON e.employeeID = v.employeeID
+      ${whereSQL}
+      GROUP BY v.employeeID, e.codeEmployee, e.firstName, e.lastName
+      ORDER BY hasPending DESC, pendingCount DESC, fullName ASC
+      `,
+      params
+    );
+
+    return res.status(200).json(rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+
+exports.getEmployeeVacationDatesByEmployee = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { employeeID } = req.params;
+
+    const [rows] = await db.query(
+      `
+      SELECT DATE_FORMAT(date, '%Y-%m-%d') AS date
+      FROM vacations_emp
+      WHERE employeeID = ?
+      ORDER BY date ASC
+      `,
+      [employeeID]
+    );
+
+    const dates = (rows || []).map((r) => r.date);
+    return res.status(200).json({ employeeID, dates });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: t("getError", language) });
+  }
+};
+
+
+
+
+// Exportar reporte de vacaciones a Excel (endpoint separado)
+exports.exportVacationsReport = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  try {
+    const [vacations] = await db.query(
+      `
+        SELECT 
+        e.codeEmployee, CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName,
+        e.hireDate, j.jobName, v.date
+        FROM 
+        employees_emp e
+        left join vacations_emp v on e.employeeID = v.employeeID
+        left join jobs_emp j on j.jobID = e.jobID
+        where e.isActive;
+      `
+    );
+
+    const result = Object.values(
+      vacations.reduce((acc, item) => {
+        const key = item.codeEmployee;
+        if (!acc[key]) {
+          acc[key] = {
+            codeEmployee: item.codeEmployee,
+            fullName: item.fullName,
+            hireDate: item.hireDate,
+            jobName: item.jobName,
+          };
+        }
+
+        // Extraer el año de la fecha si existe
+        if (item.date) {
+          const year = dayjs(item.date).year();
+          acc[key][year] = (acc[key][year] || 0) + 1;
+        }
+        return acc;
+      }, {})
+    );
+
+    let startOperacionYear = 2022;
+    let allYears = [];
+    const currentYear = new Date().getFullYear();
+    while (startOperacionYear <= currentYear) {
+      if (!allYears.includes(startOperacionYear)) {
+        allYears.push(startOperacionYear);
+      }
+      startOperacionYear++;
+    }
+
+    const normalized = result.map((emp) => {
+      allYears.forEach((y) => {
+        if (!emp[y]) emp[y] = 0;
+      });
+      return {
+        ...emp,
+        total: allYears.reduce((sum, year) => sum + emp[year], 0),
+      };
+    });
+
+    normalized.forEach((emp) => {
+      let { vacacionesDisponibles } = obtenerDiasDisponibles(
+        emp.hireDate,
+        emp.total
+      );
+      emp.vacacionesDisponibles = vacacionesDisponibles;
+    });
+
+    // Validar que tenemos datos para exportar
+    if (normalized.length === 0) {
+      return res.status(400).json({ message: "No hay datos para exportar" });
+    }
+
+    // Generar Excel
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Reporte de Vacaciones");
+
+    // Configurar encabezados
+    worksheet.columns = [
+      { header: t("employeeCode", language), key: "codeEmployee", width: 10 },
+      { header: t("fullName", language), key: "fullName", width: 30 },
+      { header: t("jobTitle", language), key: "jobName", width: 30 },
+      { header: t("hireDate", language), key: "hireDate", width: 15 },
+      ...allYears.map((year) => ({
+        header: year,
+        key: year.toString(),
+        width: 8,
+      })),
+      { header: t("total", language), key: "total", width: 10 },
+      {
+        header: t("availableDays", language),
+        key: "vacacionesDisponibles",
+        width: 15,
+      },
+    ];
+
+    // Calcular el número total de columnas
+    const totalColumns = 4 + allYears.length + 2; // 4 columnas fijas + años + total + días disponibles
+
+    // Aplicar estilos al encabezado (fila 1) solo a las columnas con datos
+    const headerRow = worksheet.getRow(1);
+    for (let col = 1; col <= totalColumns; col++) {
+      const cell = headerRow.getCell(col);
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; // Texto blanco y negrita
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF4472C4" }, // Fondo azul
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    }
+    headerRow.height = 25;
+
+    // Agregar datos
+    normalized.forEach((emp, index) => {
+      const row = [
+        emp.codeEmployee || "",
+        emp.fullName || "",
+        emp.jobName || "",
+        emp.hireDate ? dayjs(emp.hireDate).format("YYYY-MM-DD") : "",
+        ...allYears.map((year) => emp[year] || 0),
+        emp.total || 0,
+        emp.vacacionesDisponibles,
+      ];
+      const addedRow = worksheet.addRow(row);
+
+      // Aplicar negrita al nombre (columna 2)
+      addedRow.getCell(2).font = { bold: true };
+
+      // Centrar los números
+      for (let i = 5; i <= addedRow.cellCount; i++) {
+        addedRow.getCell(i).alignment = { horizontal: "center" };
+      }
+    });
+
+    // Aplicar bordes solo a las celdas con datos
+    worksheet.eachRow((row, rowNumber) => {
+      for (let col = 1; col <= totalColumns; col++) {
+        const cell = row.getCell(col);
+        cell.border = {
+          top: { style: "thin", color: { argb: "FF000000" } },
+          left: { style: "thin", color: { argb: "FF000000" } },
+          bottom: { style: "thin", color: { argb: "FF000000" } },
+          right: { style: "thin", color: { argb: "FF000000" } },
+        };
+      }
+    });
+
+    // Configura encabezados HTTP para descarga
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=vacaciones_${Date.now()}.xlsx`
+    );
+
+    // Generar el buffer del archivo Excel
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar el reporte de vacaciones:", error);
+    res
+      .status(500)
+      .json({ message: t("exportError", language) || "Error al exportar" });
+  }
+};
+
+exports.exportVacationsDetailsReport = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { startDate: qStart, endDate: qEnd } = req.query;
+
+    const isValidDate = (v) => dayjs(v, "YYYY-MM-DD", true).isValid();
+
+    let startDate = null;
+    let endDate = null;
+
+    // 1) Si viene rango -> usarlo
+    if (qStart || qEnd) {
+      const s = qStart || qEnd;
+      const e = qEnd || qStart;
+
+      if (!isValidDate(s) || !isValidDate(e)) {
+        return res.status(400).json({
+          success: false,
+          message: "Fechas inválidas. Usa formato YYYY-MM-DD en startDate/endDate.",
+        });
+      }
+
+      startDate = dayjs(s).format("YYYY-MM-DD");
+      endDate = dayjs(e).format("YYYY-MM-DD");
+
+      // asegurar orden
+      if (dayjs(endDate).isBefore(dayjs(startDate))) {
+        const tmp = startDate;
+        startDate = endDate;
+        endDate = tmp;
+      }
+    }
+
+    const sql = `
+  SELECT 
+    e.codeEmployee,
+    CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName,
+    e.hireDate,
+    j.jobName,
+    v.date,
+    v.withPaid
+  FROM vacations_emp v
+  LEFT JOIN employees_emp e ON e.employeeID = v.employeeID
+  LEFT JOIN jobs_emp j ON j.jobID = e.jobID
+  WHERE e.isActive
+  ${startDate && endDate ? "AND v.date BETWEEN ? AND ?" : ""}
+  ORDER BY v.date ASC, v.employeeID ASC;
+`;
+
+    const params = startDate && endDate ? [startDate, endDate] : [];
+
+    const [detalleVacaciones] = await db.query(sql, params);
+
+    // Organizar datos por empleado y año
+    const empleadosAgrupados = {};
+
+    detalleVacaciones.forEach((item) => {
+      const key = item.codeEmployee;
+
+      if (!empleadosAgrupados[key]) {
+        empleadosAgrupados[key] = {
+          codeEmployee: item.codeEmployee,
+          fullName: item.fullName,
+          hireDate: item.hireDate,
+          jobName: item.jobName,
+          vacacionesPorAño: {},
+        };
+      }
+
+      if (item.date) {
+        const año = dayjs(item.date).year();
+        if (!empleadosAgrupados[key].vacacionesPorAño[año]) {
+          empleadosAgrupados[key].vacacionesPorAño[año] = [];
+        }
+        const fechaFormateada = dayjs(item.date).format("DD-MM-YYYY");
+        const estado = item.withPaid == 1 ? "Con Goce" : "Sin Goce";
+
+        empleadosAgrupados[key].vacacionesPorAño[año].push(
+          `${fechaFormateada} (${estado})`
+        );
+      }
+    });
+
+    // Obtener todos los años disponibles y calcular máximo de fechas por año
+    const todosLosAños = new Set();
+    const maxFechasPorAño = {};
+
+    Object.values(empleadosAgrupados).forEach((emp) => {
+      Object.keys(emp.vacacionesPorAño).forEach((año) => {
+        const añoInt = parseInt(año);
+        todosLosAños.add(añoInt);
+
+        const numFechas = emp.vacacionesPorAño[año].length;
+        if (!maxFechasPorAño[añoInt] || numFechas > maxFechasPorAño[añoInt]) {
+          maxFechasPorAño[añoInt] = numFechas;
+        }
+      });
+    });
+
+    const añosOrdenados = Array.from(todosLosAños).sort();
+
+    // Crear el workbook
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "PMSB API";
+    workbook.created = new Date();
+
+    const worksheet = workbook.addWorksheet("Detalle de Vacaciones");
+
+    // Configurar estructura de columnas dinámicamente
+    const encabezadosBase = 4; // Código, Nombre, Fecha Ingreso, Puesto
+    let totalColumnasFechas = 0;
+    añosOrdenados.forEach((año) => {
+      totalColumnasFechas += maxFechasPorAño[año] || 0;
+    });
+    const totalColumnas = encabezadosBase + totalColumnasFechas + 2; // +2 para columnas Total y Días Disponibles
+
+    // Configurar anchos de columnas dinámicamente
+    const columnWidths = [
+      { width: 8 },  // Código
+      { width: 30 }, // Nombre
+      { width: 15 }, // Fecha de Ingreso
+      { width: 25 }, // Puesto
+    ];
+
+    // Agregar anchos para fechas
+    añosOrdenados.forEach((año) => {
+      const numFechas = maxFechasPorAño[año] || 0;
+      for (let i = 0; i < numFechas; i++) {
+        columnWidths.push({ width: 12 });
+      }
+    });
+
+    // Agregar anchos para columnas Total y Días Disponibles
+    columnWidths.push({ width: 15 }); // Total
+    columnWidths.push({ width: 18 }); // Días Disponibles
+
+    worksheet.columns = columnWidths;
+
+    // FILA 1: Encabezados principales + Años
+    const headerRow1 = worksheet.getRow(1);
+
+    headerRow1.getCell(1).value = "Código";
+    headerRow1.getCell(2).value = "Nombre";
+    headerRow1.getCell(3).value = "Fecha de Ingreso";
+    headerRow1.getCell(4).value = "Puesto";
+
+    // Años como encabezados
+    let colIndex = encabezadosBase + 1;
+    añosOrdenados.forEach((año) => {
+      const startCol = colIndex;
+      const numFechas = maxFechasPorAño[año] || 0;
+      const endCol = colIndex + numFechas - 1;
+
+      if (numFechas > 0) {
+        if (numFechas > 1) worksheet.mergeCells(1, startCol, 1, endCol);
+        headerRow1.getCell(startCol).value = año;
+        colIndex += numFechas;
+      }
+    });
+
+    headerRow1.getCell(totalColumnas - 1).value = "Total";
+    headerRow1.getCell(totalColumnas).value = "Días Disponibles";
+
+    // FILA 2: Sub-encabezados
+    const headerRow2 = worksheet.getRow(2);
+
+    for (let i = 1; i <= encabezadosBase; i++) {
+      worksheet.mergeCells(1, i, 2, i);
+    }
+
+    colIndex = encabezadosBase + 1;
+    añosOrdenados.forEach((año) => {
+      const numFechas = maxFechasPorAño[año] || 0;
+      for (let i = 0; i < numFechas; i++) {
+        headerRow2.getCell(colIndex + i).value = "Fecha";
+      }
+      colIndex += numFechas;
+    });
+
+    worksheet.mergeCells(1, totalColumnas - 1, 2, totalColumnas - 1);
+    headerRow2.getCell(totalColumnas - 1).value = "Días";
+
+    worksheet.mergeCells(1, totalColumnas, 2, totalColumnas);
+    headerRow2.getCell(totalColumnas).value = "Restantes";
+
+    // Estilos FILA 1 base
+    for (let col = 1; col <= encabezadosBase; col++) {
+      const cell = headerRow1.getCell(col);
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    }
+
+    // Estilos años
+    colIndex = encabezadosBase + 1;
+    añosOrdenados.forEach((año) => {
+      const numFechas = maxFechasPorAño[año] || 0;
+      if (numFechas > 0) {
+        const cell = headerRow1.getCell(colIndex);
+        cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF70AD47" } };
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+        colIndex += numFechas;
+      }
+    });
+
+    // Estilos FILA 2
+    colIndex = encabezadosBase + 1;
+    añosOrdenados.forEach((año) => {
+      const numFechas = maxFechasPorAño[año] || 0;
+      for (let i = 0; i < numFechas; i++) {
+        const cell = headerRow2.getCell(colIndex + i);
+        cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF92D050" } };
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+      }
+      colIndex += numFechas;
+    });
+
+    // Estilos Total/Días disponibles
+    const totalCell = headerRow1.getCell(totalColumnas - 1);
+    totalCell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    totalCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFF6F00" } };
+    totalCell.alignment = { vertical: "middle", horizontal: "center" };
+
+    const diasDisponiblesCell = headerRow1.getCell(totalColumnas);
+    diasDisponiblesCell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    diasDisponiblesCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFF6F00" } };
+    diasDisponiblesCell.alignment = { vertical: "middle", horizontal: "center" };
+
+    headerRow1.height = 25;
+    headerRow2.height = 25;
+
+    // Agregar datos
+    Object.values(empleadosAgrupados).forEach((empleado) => {
+      const fila = [
+        empleado.codeEmployee,
+        empleado.fullName,
+        dayjs(empleado.hireDate).format("DD-MM-YYYY"),
+        empleado.jobName,
+      ];
+
+      let totalDias = 0;
+
+      añosOrdenados.forEach((año) => {
+        const fechasDelAño = empleado.vacacionesPorAño[año] || [];
+        const numFechas = maxFechasPorAño[año] || 0;
+
+        totalDias += fechasDelAño.length;
+
+        for (let i = 0; i < numFechas; i++) {
+          fila.push(fechasDelAño[i] || "");
+        }
+      });
+
+      const { vacacionesDisponibles } = obtenerDiasDisponibles(
+        empleado.hireDate,
+        totalDias
+      );
+
+      fila.push(totalDias);
+      fila.push(vacacionesDisponibles);
+
+      const addedRow = worksheet.addRow(fila);
+
+      addedRow.getCell(2).font = { bold: true };
+
+      const totalCellRow = addedRow.getCell(totalColumnas - 1);
+      totalCellRow.font = { bold: true };
+      totalCellRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+
+      const diasDisponiblesCellRow = addedRow.getCell(totalColumnas);
+      diasDisponiblesCellRow.font = { bold: true };
+
+      if (vacacionesDisponibles < 0) {
+        diasDisponiblesCellRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFCCCC" } };
+        diasDisponiblesCellRow.font = { bold: true, color: { argb: "FFCC0000" } };
+      } else {
+        diasDisponiblesCellRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFCCFFCC" } };
+      }
+
+      for (let col = encabezadosBase + 1; col <= totalColumnas; col++) {
+        addedRow.getCell(col).alignment = { horizontal: "center" };
+      }
+    });
+
+    // Bordes
+    worksheet.eachRow((row) => {
+      for (let col = 1; col <= totalColumnas; col++) {
+        const cell = row.getCell(col);
+        cell.border = {
+          top: { style: "thin", color: { argb: "FF000000" } },
+          left: { style: "thin", color: { argb: "FF000000" } },
+          bottom: { style: "thin", color: { argb: "FF000000" } },
+          right: { style: "thin", color: { argb: "FF000000" } },
+        };
+      }
+    });
+
+    // Nombre del archivo (incluye rango si aplica)
+    const suffix =
+      startDate && endDate ? `${startDate}_a_${endDate}` : dayjs().format("YYYY-MM-DD");
+    const fileName = `Detalle_Vacaciones_${suffix}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.send(buffer);
+  } catch (error) {
+    console.error("Error al exportar el reporte detallado de vacaciones:", error);
+    res.status(500).json({ message: t("exportError", language) || "Error al exportar" });
+  }
+};
+// Exportar reporte detallado de vacaciones a Excel
+// exports.exportVacationsDetailsReport = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//     const [detalleVacaciones] = await db.query(
+//       `
+//         SELECT 
+//         e.codeEmployee, CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName) as fullName,
+//         e.hireDate, j.jobName, v.date
+//         FROM vacations_emp v
+//         left join employees_emp e on e.employeeID = v.employeeID
+//         left join jobs_emp j on j.jobID = e.jobID
+//         where e.isActive
+//         order by v.date asc, v.employeeID asc;
+//       `
+//     );
+
+//     // Organizar datos por empleado y año
+//     const empleadosAgrupados = {};
+
+//     detalleVacaciones.forEach((item) => {
+//       const key = item.codeEmployee;
+
+//       if (!empleadosAgrupados[key]) {
+//         empleadosAgrupados[key] = {
+//           codeEmployee: item.codeEmployee,
+//           fullName: item.fullName,
+//           hireDate: item.hireDate,
+//           jobName: item.jobName,
+//           vacacionesPorAño: {},
+//         };
+//       }
+
+//       if (item.date) {
+//         const año = dayjs(item.date).year();
+//         if (!empleadosAgrupados[key].vacacionesPorAño[año]) {
+//           empleadosAgrupados[key].vacacionesPorAño[año] = [];
+//         }
+//         empleadosAgrupados[key].vacacionesPorAño[año].push(
+//           dayjs(item.date).format("DD-MM-YYYY")
+//         );
+//       }
+//     });
+
+//     // Obtener todos los años disponibles y calcular máximo de fechas por año
+//     const todosLosAños = new Set();
+//     const maxFechasPorAño = {};
+
+//     Object.values(empleadosAgrupados).forEach((emp) => {
+//       Object.keys(emp.vacacionesPorAño).forEach((año) => {
+//         const añoInt = parseInt(año);
+//         todosLosAños.add(añoInt);
+
+//         const numFechas = emp.vacacionesPorAño[año].length;
+//         if (!maxFechasPorAño[añoInt] || numFechas > maxFechasPorAño[añoInt]) {
+//           maxFechasPorAño[añoInt] = numFechas;
+//         }
+//       });
+//     });
+
+//     const añosOrdenados = Array.from(todosLosAños).sort();
+
+//     // Crear el workbook
+//     const workbook = new ExcelJS.Workbook();
+//     workbook.creator = "PMSB API";
+//     workbook.created = new Date();
+
+//     const worksheet = workbook.addWorksheet("Detalle de Vacaciones");
+
+//     // Configurar estructura de columnas dinámicamente
+//     const encabezadosBase = 4; // Código, Nombre, Fecha Ingreso, Puesto
+//     let totalColumnasFechas = 0;
+//     añosOrdenados.forEach((año) => {
+//       totalColumnasFechas += maxFechasPorAño[año] || 0;
+//     });
+//     const totalColumnas = encabezadosBase + totalColumnasFechas + 2; // +2 para columnas Total y Días Disponibles
+
+//     // Configurar anchos de columnas dinámicamente
+//     const columnWidths = [
+//       { width: 8 }, // Código
+//       { width: 30 }, // Nombre
+//       { width: 15 }, // Fecha de Ingreso
+//       { width: 25 }, // Puesto
+//     ];
+
+//     // Agregar anchos para fechas
+//     añosOrdenados.forEach((año) => {
+//       const numFechas = maxFechasPorAño[año] || 0;
+//       for (let i = 0; i < numFechas; i++) {
+//         columnWidths.push({ width: 12 });
+//       }
+//     });
+
+//     // Agregar anchos para columnas Total y Días Disponibles
+//     columnWidths.push({ width: 15 }); // Total
+//     columnWidths.push({ width: 18 }); // Días Disponibles
+
+//     worksheet.columns = columnWidths;
+
+//     // FILA 1: Encabezados principales + Años
+//     const headerRow1 = worksheet.getRow(1);
+
+//     // Encabezados base
+//     headerRow1.getCell(1).value = "Código";
+//     headerRow1.getCell(2).value = "Nombre";
+//     headerRow1.getCell(3).value = "Fecha de Ingreso";
+//     headerRow1.getCell(4).value = "Puesto";
+
+//     // Años como encabezados
+//     let colIndex = encabezadosBase + 1;
+//     añosOrdenados.forEach((año) => {
+//       const startCol = colIndex;
+//       const numFechas = maxFechasPorAño[año] || 0;
+//       const endCol = colIndex + numFechas - 1;
+
+//       if (numFechas > 0) {
+//         // Combinar celdas para el año
+//         if (numFechas > 1) {
+//           worksheet.mergeCells(1, startCol, 1, endCol);
+//         }
+//         headerRow1.getCell(startCol).value = año;
+
+//         colIndex += numFechas;
+//       }
+//     });
+
+//     // Agregar columnas "Total" y "Días Disponibles" al final
+//     headerRow1.getCell(totalColumnas - 1).value = "Total";
+//     headerRow1.getCell(totalColumnas).value = "Días Disponibles";
+
+//     // FILA 2: Sub-encabezados (Fecha repetida)
+//     const headerRow2 = worksheet.getRow(2);
+
+//     // Encabezados base vacíos (se combinan con fila 1)
+//     for (let i = 1; i <= encabezadosBase; i++) {
+//       worksheet.mergeCells(1, i, 2, i);
+//     }
+
+//     // "Fecha" repetida bajo cada año
+//     colIndex = encabezadosBase + 1;
+//     añosOrdenados.forEach((año) => {
+//       const numFechas = maxFechasPorAño[año] || 0;
+//       for (let i = 0; i < numFechas; i++) {
+//         headerRow2.getCell(colIndex + i).value = "Fecha";
+//       }
+//       colIndex += numFechas;
+//     });
+
+//     // Combinar celdas Total y Días Disponibles (fila 1 y 2)
+//     worksheet.mergeCells(1, totalColumnas - 1, 2, totalColumnas - 1);
+//     headerRow2.getCell(totalColumnas - 1).value = "Días";
+
+//     worksheet.mergeCells(1, totalColumnas, 2, totalColumnas);
+//     headerRow2.getCell(totalColumnas).value = "Restantes";
+
+//     // Aplicar estilos a la FILA 1
+//     for (let col = 1; col <= encabezadosBase; col++) {
+//       const cell = headerRow1.getCell(col);
+//       cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//       cell.fill = {
+//         type: "pattern",
+//         pattern: "solid",
+//         fgColor: { argb: "FF4472C4" },
+//       };
+//       cell.alignment = { vertical: "middle", horizontal: "center" };
+//     }
+
+//     // Estilos para los años
+//     colIndex = encabezadosBase + 1;
+//     añosOrdenados.forEach((año) => {
+//       const numFechas = maxFechasPorAño[año] || 0;
+//       if (numFechas > 0) {
+//         const cell = headerRow1.getCell(colIndex);
+//         cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//         cell.fill = {
+//           type: "pattern",
+//           pattern: "solid",
+//           fgColor: { argb: "FF70AD47" }, // Verde para años
+//         };
+//         cell.alignment = { vertical: "middle", horizontal: "center" };
+//         colIndex += numFechas;
+//       }
+//     });
+
+//     // Aplicar estilos a la FILA 2
+//     colIndex = encabezadosBase + 1;
+//     añosOrdenados.forEach((año) => {
+//       const numFechas = maxFechasPorAño[año] || 0;
+//       for (let i = 0; i < numFechas; i++) {
+//         const cell = headerRow2.getCell(colIndex + i);
+//         cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//         cell.fill = {
+//           type: "pattern",
+//           pattern: "solid",
+//           fgColor: { argb: "FF92D050" }, // Verde claro para "Fecha"
+//         };
+//         cell.alignment = { vertical: "middle", horizontal: "center" };
+//       }
+//       colIndex += numFechas;
+//     });
+
+//     // Estilos para columna Total
+//     const totalCell = headerRow1.getCell(totalColumnas - 1);
+//     totalCell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//     totalCell.fill = {
+//       type: "pattern",
+//       pattern: "solid",
+//       fgColor: { argb: "FFFF6F00" }, // Naranja para Total
+//     };
+//     totalCell.alignment = { vertical: "middle", horizontal: "center" };
+
+//     // Estilos para columna Días Disponibles
+//     const diasDisponiblesCell = headerRow1.getCell(totalColumnas);
+//     diasDisponiblesCell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+//     diasDisponiblesCell.fill = {
+//       type: "pattern",
+//       pattern: "solid",
+//       fgColor: { argb: "FFFF6F00" },
+//     };
+//     diasDisponiblesCell.alignment = {
+//       vertical: "middle",
+//       horizontal: "center",
+//     };
+
+//     // Establecer altura de las filas de encabezado
+//     headerRow1.height = 25;
+//     headerRow2.height = 25;
+
+//     // Agregar datos de empleados
+//     Object.values(empleadosAgrupados).forEach((empleado) => {
+//       const fila = [
+//         empleado.codeEmployee,
+//         empleado.fullName,
+//         dayjs(empleado.hireDate).format("DD-MM-YYYY"),
+//         empleado.jobName,
+//       ];
+
+//       // Calcular total de días de vacaciones
+//       let totalDias = 0;
+
+//       // Agregar fechas por año
+//       añosOrdenados.forEach((año) => {
+//         const fechasDelAño = empleado.vacacionesPorAño[año] || [];
+//         const numFechas = maxFechasPorAño[año] || 0;
+
+//         // Contar fechas no vacías para el total
+//         totalDias += fechasDelAño.length;
+
+//         for (let i = 0; i < numFechas; i++) {
+//           fila.push(fechasDelAño[i] || "");
+//         }
+//       });
+
+//       // Calcular días disponibles usando la función
+//       const { vacacionesDisponibles } = obtenerDiasDisponibles(
+//         empleado.hireDate,
+//         totalDias
+//       );
+
+//       // Agregar el total y días disponibles al final
+//       fila.push(totalDias);
+//       fila.push(vacacionesDisponibles);
+
+//       const addedRow = worksheet.addRow(fila);
+
+//       // Aplicar negrita al nombre (columna 2)
+//       addedRow.getCell(2).font = { bold: true };
+
+//       // Aplicar negrita y color al total
+//       const totalCellRow = addedRow.getCell(totalColumnas - 1);
+//       totalCellRow.font = { bold: true };
+//       totalCellRow.fill = {
+//         type: "pattern",
+//         pattern: "solid",
+//         fgColor: { argb: "FFFFF2CC" }, // Fondo amarillo claro para total
+//       };
+
+//       // Aplicar negrita y color a días disponibles
+//       const diasDisponiblesCellRow = addedRow.getCell(totalColumnas);
+//       diasDisponiblesCellRow.font = { bold: true };
+
+//       // Color diferente si es negativo (rojo) o positivo (verde claro)
+//       if (vacacionesDisponibles < 0) {
+//         diasDisponiblesCellRow.fill = {
+//           type: "pattern",
+//           pattern: "solid",
+//           fgColor: { argb: "FFFFCCCC" }, // Fondo rojo claro para negativos
+//         };
+//         diasDisponiblesCellRow.font = {
+//           bold: true,
+//           color: { argb: "FFCC0000" },
+//         }; // Texto rojo
+//       } else {
+//         diasDisponiblesCellRow.fill = {
+//           type: "pattern",
+//           pattern: "solid",
+//           fgColor: { argb: "FFCCFFCC" }, // Fondo verde claro para positivos
+//         };
+//       }
+
+//       // Centrar fechas y total
+//       for (let col = encabezadosBase + 1; col <= totalColumnas; col++) {
+//         addedRow.getCell(col).alignment = { horizontal: "center" };
+//       }
+//     });
+
+//     // Aplicar bordes a todas las celdas con datos
+//     worksheet.eachRow((row, rowNumber) => {
+//       for (let col = 1; col <= totalColumnas; col++) {
+//         const cell = row.getCell(col);
+//         cell.border = {
+//           top: { style: "thin", color: { argb: "FF000000" } },
+//           left: { style: "thin", color: { argb: "FF000000" } },
+//           bottom: { style: "thin", color: { argb: "FF000000" } },
+//           right: { style: "thin", color: { argb: "FF000000" } },
+//         };
+//       }
+//     });
+
+//     // Configurar respuesta para descarga
+//     const fileName = `Detalle_Vacaciones_${dayjs().format("YYYY-MM-DD")}.xlsx`;
+
+//     res.setHeader(
+//       "Content-Type",
+//       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+//     );
+//     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+//     // Generar y enviar el archivo
+//     const buffer = await workbook.xlsx.writeBuffer();
+//     res.send(buffer);
+//   } catch (error) {
+//     console.error(
+//       "Error al exportar el reporte detallado de vacaciones:",
+//       error
+//     );
+//     res
+//       .status(500)
+//       .json({ message: t("exportError", language) || "Error al exportar" });
+//   }
+// };
+
+// Agregar vacaciones (con GOCE/SIN GOCE)
+exports.addEmployeeVacation = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { dates, employees, withPaid } = req.body;
+
+    // Validar que los datos son correctos
+    if (!Array.isArray(employees) || employees.length === 0 || !Array.isArray(dates) || dates.length === 0) {
+      return res.status(400).json({ message: t("requiredFields", language) });
+    }
+
+    // Normalizar withPaid -> 0/1
+    const paid = withPaid ? 1 : 0;
+
+    // Validar/normalizar fechas (YYYY-MM-DD) y quitar duplicadas
+    const cleanDates = Array.from(
+      new Set(
+        dates
+          .map((d) => String(d).slice(0, 10))
+          .filter((d) => dayjs(d, "YYYY-MM-DD", true).isValid())
+      )
+    );
+
+    if (cleanDates.length === 0) {
+      return res.status(400).json({
+        message: "Fechas inválidas. Usa formato YYYY-MM-DD.",
+      });
+    }
+
+    const audit = camposAuditoriaADD(req);
+
+
+    const insertPromises = [];
+
+    for (const date of cleanDates) {
+      for (const employeeID of employees) {
+        insertPromises.push(
+          db.query(
+            `
+              INSERT INTO vacations_emp (employeeID, date, createdDate, createdBy, withPaid)
+              VALUES (?, ?, ?, ?, ?)
+            `,
+            [employeeID, date, ...audit, paid]
+          )
+        );
+      }
+    }
+
+    await Promise.all(insertPromises);
+
+    return res.status(201).json({ message: t("saveSuccess", language) });
+  } catch (error) {
+    console.error("Error al agregar vacaciones:", error);
+    return res.status(500).json({ message: t("saveError", language) });
+  }
+};
+
+
+// // Agregar vaciones
+// exports.addEmployeeVacation = async (req, res) => {
+//   const language = req.headers["accept-language"] || "en";
+//   try {
+//     const { dates, employees } = req.body;
+
+//     // Validar que los datos son correctos
+//     if (!Array.isArray(employees) || employees.length === 0 || !dates) {
+//       return res.status(400).json({ message: t("requiredFields", language) });
+//     }
+
+//     const insertPromises = dates.map(async (date) => {
+//       try {
+//         employees.forEach(async (employeeID) => {
+//           await db
+//             .query(
+//               `
+//           INSERT INTO vacations_emp (employeeID, date, createdDate, createdBy)
+//           VALUES (?, ?, ?, ?)
+//         `,
+//               [employeeID, date, ...camposAuditoriaADD(req)]
+//             )
+//             .catch((insertError) => {
+//               console.error(
+//                 `Error al insertar vacaciones para el empleado ${employeeID} en la fecha ${date}:`,
+//                 insertError
+//               );
+//             });
+//         });
+//       } catch (insertError) {
+//         throw new Error(t("saveError", language));
+//       }
+//     });
+
+//     await Promise.all(insertPromises);
+
+//     res.status(201).json({ message: t("saveSuccess", language) });
+//   } catch (error) {
+//     console.error("Error al agregar vacaciones:", error);
+//     res.status(500).json({ message: t("saveError", language) });
+//   }
+// };
+
+//         "2023-12-18",
+//         "2023-12-19",
+//         "2023-12-20",
+//         "2023-12-21",
+//         "2023-12-22",
+//         "2023-12-23",
+//         "2023-12-26",
+//         "2023-12-27",
+//         "2023-12-28",
+//         "2023-12-29",
+//         "2023-12-30",
+//         "2024-01-02"
+
+//   '2022-12-19', '2022-12-20',
+//   '2022-12-21', '2022-12-22',
+//   '2022-12-23', '2022-12-24',
+//   '2022-12-26', '2022-12-27',
+//   '2022-12-28', '2022-12-29',
+//   '2022-12-30', '2022-12-31'
+
+// "2024-12-23",
+// "2024-12-24",
+// "2024-12-26",
+// "2024-12-27",
+// "2024-12-28",
+// "2024-12-30",
+// "2024-12-31",
+// "2025-01-02",
+// "2025-01-03",
+// "2025-01-04"
+
+// Eliminar vacaciones de empleado
+exports.deleteEmployeeVacation = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  const { vacationID } = req.params;
+  if (!isValidNumber(vacationID)) {
+    return res.status(500).json({ message: "ID de vacaciones inválido" });
+  }
+  try {
+    await db.query("DELETE FROM vacations_emp WHERE vacationID = ?", [
+      vacationID,
+    ]);
+    res.status(200).json({ message: t("deleteSuccess", language) });
+  } catch (error) {
+    console.error("Error al eliminar vacaciones:", error);
+    res.status(500).json({ message: t("deleteError", language) });
+  }
+};
+
+exports.deleteVacationByDate = async (req, res) => {
+  const language = (req.headers["accept-language"] || "en").toLowerCase();
+  const { employeeID, date } = req.query;
+
+  const isValidNumber = (v) => /^\d+$/.test(String(v || "").trim());
+  const isValidDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "").trim());
+
+  if (!isValidNumber(employeeID)) {
+    return res.status(400).json({ message: "employeeID inválido" });
+  }
+  if (!isValidDate(date)) {
+    return res.status(400).json({ message: "Fecha inválida (YYYY-MM-DD)" });
+  }
+
+  try {
+    // 👇 AJUSTA vacationDate al nombre real
+    const [result] = await db.query(
+      `DELETE FROM vacations_emp
+       WHERE employeeID = ? AND DATE(date) = ?`,
+      [employeeID, date]
+    );
+
+    if (!result?.affectedRows) {
+      return res.status(404).json({ message: "No se encontró esa vacación para eliminar" });
+    }
+
+    return res.status(200).json({ message: t("deleteSuccess", language) || "Eliminado correctamente" });
+  } catch (error) {
+    console.error("Error al eliminar vacaciones (by date):", error);
+    return res.status(500).json({ message: t("deleteError", language) || "Error al eliminar" });
+  }
+};
+
+// Agregar días de permisos especiales.
+exports.addEmployeePermissionSpecial = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+
+  try {
+    const { dates, employees } = req.body;
+
+    if (!Array.isArray(employees) || employees.length === 0 || !dates || !Array.isArray(dates) || dates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: t("requiredFields", language),
+      });
+    }
+
+    const cleanEmployees = Array.from(
+      new Set(
+        employees
+          .map((id) => Number(id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+
+    const cleanDates = Array.from(
+      new Set(
+        dates
+          .map((d) => dayjs(d).format("YYYY-MM-DD"))
+          .filter((d) => d !== "Invalid Date" && dayjs(d, "YYYY-MM-DD", true).isValid())
+      )
+    );
+
+    if (cleanEmployees.length === 0 || cleanDates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: t("requiredFields", language),
+      });
+    }
+
+    const auditFields = camposAuditoriaADD(req);
+    const valuesToInsert = [];
+    const skippedMessages = [];
+
+    // Validar cada combinación empleado/fecha
+    for (const employeeID of cleanEmployees) {
+      for (const date of cleanDates) {
+
+        // 1. Validar marcaje de asistencia
+        const [attendance] = await db.query(
+          `SELECT hattendanceID FROM h_attendance_emp WHERE employeeID = ? AND DATE(date) = ? LIMIT 1`,
+          [employeeID, date]
+        );
+
+        if (attendance.length > 0) {
+          const [[emp]] = await db.query(
+            `SELECT codeEmployee, firstName, lastName FROM employees_emp WHERE employeeID = ?`,
+            [employeeID]
+          );
+          skippedMessages.push(
+            `Empleado ${emp?.codeEmployee || employeeID} - ${emp?.firstName || ''} ${emp?.lastName || ''} omitido: Ya marcó asistencia el ${date}`
+          );
+          continue; // Pasa al siguiente registro sin agregarlo
+        }
+
+        // 2. Validar si ya tiene baja carga registrada
+        const [existingPermission] = await db.query(
+          `SELECT permissionSpecialID FROM permissionspecial_emp WHERE employeeID = ? AND DATE(date) = ? LIMIT 1`,
+          [employeeID, date]
+        );
+
+        if (existingPermission.length > 0) {
+          const [[emp]] = await db.query(
+            `SELECT codeEmployee, firstName, lastName FROM employees_emp WHERE employeeID = ?`,
+            [employeeID]
+          );
+          skippedMessages.push(
+            `Empleado ${emp?.codeEmployee || employeeID} - ${emp?.firstName || ''} ${emp?.lastName || ''} omitido: Ya tiene baja carga el ${date}`
+          );
+          continue; // Pasa al siguiente registro sin agregarlo
+        }
+
+        // Si supera las dos validaciones, se agrega a los inserts
+        valuesToInsert.push([employeeID, date, ...auditFields]);
+      }
+    }
+
+    // Si ningún empleado era apto para insertarse
+    if (valuesToInsert.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No se insertó ningún registro. Todos los empleados seleccionados ya registraron asistencia o tienen baja carga previa.",
+        skipped: skippedMessages
+      });
+    }
+
+    // Inserción masiva de los empleados válidos
+    const [result] = await db.query(
+      `
+      INSERT INTO permissionspecial_emp
+        (employeeID, date, createdDate, createdBy)
+      VALUES ?
+      `,
+      [valuesToInsert]
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: skippedMessages.length > 0
+        ? `Se asignó la baja carga a los empleados disponibles (${result.affectedRows} registros). Omitidos: ${skippedMessages.length}`
+        : t("saveSuccess", language),
+      permissionSpecialID: result.insertId,
+      insertedRows: result.affectedRows,
+      skipped: skippedMessages
+    });
+
+  } catch (error) {
+    console.error("Error al agregar permisos especiales:", error);
+    res.status(500).json({
+      success: false,
+      message: t("saveError", language),
+    });
+  }
+};
+//permite ver los permisos de baja carga en menu de permisos
+exports.vistaEmployeePermissionSpecialLow = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  let { startDate, endDate } = req.query;
+
+  // Si no viene un rango de fechas, usar la actual para ambos límites
+  if (!startDate || !endDate) {
+    const hoy = new Date();
+    const year = hoy.getFullYear();
+    const month = String(hoy.getMonth() + 1).padStart(2, "0");
+    const day = String(hoy.getDate()).padStart(2, "0");
+    const hoyFormateado = `${year}-${month}-${day}`;
+
+    if (!startDate) startDate = hoyFormateado;
+    if (!endDate) endDate = hoyFormateado;
+  }
+
+  try {
+    // 1. Obtener los permisos haciendo JOIN con empleados para poder ORDENAR correctamente
+    let query = `
+      SELECT 
+        p.permissionSpecialID, 
+        p.date, 
+        p.employeeID, 
+        p.createdDate, 
+        p.createdBy,
+        e.codeEmployee,
+        CONCAT(
+          IFNULL(e.firstName, ''), ' ',
+          IFNULL(e.lastName, ''), ' ',
+          IFNULL(e.secondLastName, '')
+        ) AS fullName,
+        l.linesNumber
+      FROM permissionspecial_emp p
+      INNER JOIN employees_emp e ON p.employeeID = e.employeeID
+      LEFT JOIN employeeLines_emp el ON e.employeeID = el.employeeID
+      LEFT JOIN lines_emp l ON el.linesID = l.linesID
+    `;
+
+    const queryParams = [];
+
+    if (startDate && endDate) {
+      query += ` WHERE p.date BETWEEN ? AND ? `;
+      queryParams.push(startDate, endDate);
+    }
+
+    // CORREGIDO: Primero ordenamos numéricamente por código de empleado, y luego por la fecha del permiso
+    query += ` ORDER BY p.date ASC, CAST(e.codeEmployee AS UNSIGNED) ASC, p.permissionSpecialID DESC `;
+
+    const [rows] = await db.query(query, queryParams);
+
+    if (rows.length === 0) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    // 2. Mapear cada fila directamente al formato del cliente (ya viene ordenada de la BD)
+    const result = rows.map((row) => {
+      let d = row.date;
+      if (d instanceof Date) {
+        d = d.toISOString().split("T")[0];
+      }
+      // Formatear la fecha a YYYY/MM/DD para mantener el estilo visual
+      const formattedDate = d ? d.replace(/-/g, "/") : "";
+
+      return {
+        permissionSpecialID: row.permissionSpecialID,
+        permissionSpecialIDs: [row.permissionSpecialID],
+        employeeID: row.employeeID,
+        codeEmployee: row.codeEmployee || "",
+        fullName: row.fullName ? row.fullName.trim().replace(/\s+/g, ' ') : "", // Limpia espacios dobles de nombres vacíos
+        linesNumber: row.linesNumber || null,
+        dates: [formattedDate],
+        datesString: formattedDate
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+
+  } catch (error) {
+    console.error("Error en vistaEmployeePermissionSpecial:", error);
+    return res.status(500).json({
+      success: false,
+      message: t("saveError", language),
+    });
+  }
+};
+
+// Exportar reporte de bajas/permisos especiales a Excel por rango de fechas
+exports.exportSpecialPermissionReport = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    const [records] = await db.query(
+      `SELECT 
+          e.codeEmployee,
+          CONCAT_WS(' ', e.firstName, e.middleName, e.lastName, e.secondLastName) AS fullName,
+          l.linesNumber,
+          pay.payrollName AS planilla,
+          ps.date
+       FROM permissionspecial_emp ps
+       INNER JOIN employees_emp e ON e.employeeID = ps.employeeID
+       LEFT JOIN payrolltype_emp pay ON pay.payrollTypeID = e.payrollTypeID
+       LEFT JOIN employeelines_emp el ON el.employeeID = e.employeeID
+       LEFT JOIN lines_emp l ON l.linesID = el.linesID
+       WHERE ps.date BETWEEN ? AND ?
+       ORDER BY ps.date ASC, CAST(e.codeEmployee AS UNSIGNED) ASC`,
+      [startDate, endDate]
+    );
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Baja Carga");
+
+    // Definición de columnas incluyendo "Planilla"
+    sheet.columns = [
+      { header: "Código", key: "codeEmployee", width: 12 },
+      { header: "Nombre Completo", key: "fullName", width: 35 },
+      { header: "Línea", key: "linesNumber", width: 12 },
+      { header: "Planilla", key: "planilla", width: 16 }, // << NUEVA COLUMNA
+      { header: "Fecha", key: "date", width: 15 },
+    ];
+
+    // Estilos de cabecera
+    sheet.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF1F3864" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+
+    // Filas de datos
+    records.forEach((rec) => {
+      sheet.addRow({
+        codeEmployee: rec.codeEmployee,
+        fullName: rec.fullName,
+        linesNumber: rec.linesNumber ? `LÍNEA ${rec.linesNumber}` : "N/A",
+        planilla: rec.planilla ? rec.planilla.toUpperCase() : "N/A", // Semanal / Quincenal
+        date: dayjs(rec.date).format("DD/MM/YYYY"),
+      });
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="Reporte_Baja_Carga_${startDate}_al_${endDate}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar reporte de baja carga:", error);
+    res.status(500).json({ message: "Error al generar el archivo Excel." });
+  }
+};
+
+//permite ver los permisos especiales en absence management 
+exports.vistaEmployeePermissionSpecial = async (req, res) => {
+  const language = req.headers["accept-language"] || "en";
+  let { date } = req.query;
+
+  // Si no viene fecha, usar la actual
+  if (!date) {
+    const hoy = new Date();
+    const year = hoy.getFullYear();
+    const month = String(hoy.getMonth() + 1).padStart(2, "0");
+    const day = String(hoy.getDate()).padStart(2, "0");
+    date = `${year}-${month}-${day}`;
+  }
+
+  try {
+    let query = `
+      SELECT permissionSpecialID, date, employeeID, createdDate, createdBy
+      FROM permissionspecial_emp
+    `;
+
+    const queryParams = [];
+
+    // filtro por fecha (DATE real)
+    if (date) {
+      query += ` WHERE date = ? `;
+      queryParams.push(date);
+    }
+
+    query += ` ORDER BY permissionSpecialID DESC `;
+
+    const [rows] = await db.query(query, queryParams);
+
+    const byEmployee = new Map();
+
+    for (const row of rows) {
+      const empID = row.employeeID;
+
+      let d = row.date;
+
+      // por seguridad si mysql devuelve Date object
+      if (d instanceof Date) {
+        d = d.toISOString().split("T")[0];
+      }
+
+      if (!byEmployee.has(empID)) {
+        byEmployee.set(empID, {
+          employeeID: empID,
+          dates: [],
+          permissionSpecialIDs: []
+        });
+      }
+
+      const entry = byEmployee.get(empID);
+
+      // agregar fecha
+      if (d && !entry.dates.includes(d)) {
+        entry.dates.push(d);
+      }
+
+      // agregar permiso
+      if (!entry.permissionSpecialIDs.includes(row.permissionSpecialID)) {
+        entry.permissionSpecialIDs.push(row.permissionSpecialID);
+      }
+    }
+
+    if (byEmployee.size === 0) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const empIds = Array.from(byEmployee.keys());
+
+    const [empData] = await db.query(`
+      SELECT
+        e.employeeID,
+        e.codeEmployee,
+        CONCAT(
+          IFNULL(e.firstName, ''), ' ',
+          IFNULL(e.middleName, ''), ' ',
+          IFNULL(e.lastName, ''), ' ',
+          IFNULL(e.secondLastName, '')
+        ) AS fullName,
+        l.linesNumber 
+      FROM employees_emp e
+      LEFT JOIN employeeLines_emp el ON e.employeeID = el.employeeID
+      LEFT JOIN lines_emp l ON el.linesID = l.linesID
+      WHERE e.employeeID IN (?)
+    `, [empIds]);
+
+    const result = empData.map((emp) => {
+      const info = byEmployee.get(emp.employeeID);
+
+      const sortedDates = (info.dates || [])
+        .sort()
+        .map((d) => d.replace(/-/g, "/"));
+
+      return {
+        employeeID: emp.employeeID,
+        codeEmployee: emp.codeEmployee,
+        fullName: emp.fullName,
+        linesNumber: emp.linesNumber,
+        dates: sortedDates,
+        datesString: sortedDates.join(" - "),
+        permissionSpecialID: info.permissionSpecialIDs?.[0] || null,
+        permissionSpecialIDs: info.permissionSpecialIDs || []
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+
+  } catch (error) {
+    console.error("Error en vistaEmployeePermissionSpecial:", error);
+    return res.status(500).json({
+      success: false,
+      message: t("saveError", language),
+    });
+  }
+};
+
+exports.deleteEmployeePermissionSpecial = async (req, res) => {
+  const { employeeID } = req.params;
+  const { date } = req.query;
+
+  try {
+    const empIdNum = Number(employeeID);
+
+    if (!empIdNum) {
+      return res.status(400).json({
+        success: false,
+        message: "employeeID inválido",
+      });
+    }
+
+    if (!date) {
+      return res.status(400).json({
+        success: false,
+        message: "Es requerido especificar la fecha",
+      });
+    }
+
+    // DELETE directo (modelo nuevo)
+    const [result] = await db.query(
+      `
+      DELETE FROM permissionspecial_emp
+      WHERE employeeID = ?
+      AND date = ?
+      `,
+      [empIdNum, date]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No existía permiso para eliminar",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Permiso especial eliminado correctamente",
+    });
+
+  } catch (error) {
+    console.error("Error al eliminar permiso especial:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al eliminar permisos especiales del empleado",
+    });
+  }
+};
+
+exports.deleteAllEmployeePermissionSpecial = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ message: "Las fechas de inicio y fin son requeridas." });
+    }
+
+    await db.query(
+      `DELETE FROM permissionspecial_emp 
+       WHERE date BETWEEN ? AND ?`,
+      [startDate, endDate]
+    );
+
+    res.status(200).json({ success: true, message: "Registros de baja carga eliminados correctamente." });
+  } catch (error) {
+    console.error("Error al eliminar masivamente registros de baja carga:", error);
+    res.status(500).json({ message: "Error interno del servidor al eliminar registros." });
+  }
+};
+
+
+exports.exportarInformacion = async (req, res) => {
+  try {
+    const [infoGeneral] = await db.query(
+      "SELECT * FROM pmsb.employees_full_info",
+    );
+
+    const [children] = await db.query(
+      `
+        SELECT
+          CONCAT(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) AS Nombre,
+          DATE_FORMAT(f.birthDate, '%Y-%m-%d') AS FechaNacimiento,
+          TIMESTAMPDIFF(YEAR, f.birthDate, CURDATE()) AS Edad,
+          f.birthCert AS Identidad,
+          g.genderName AS Genero,
+          f.employeeID AS Code,
+          CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) AS Employee
+        FROM children_emp f
+        INNER JOIN employees_emp e ON e.employeeID = f.employeeID
+        INNER JOIN gender_emp g ON g.genderID = f.genderID
+        order by f.employeeID
+      `
+    );
+
+    const [familyInformation] = await db.query(
+      `
+        SELECT
+          r.relativesTypeDesc AS Parentesco,
+          CONCAT(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) AS Nombre,
+          f.age AS Edad,
+          f.employeeID AS Code,
+          CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) AS Employee
+        FROM familyinformation_emp f
+        INNER JOIN employees_emp e ON e.employeeID = f.employeeID
+        INNER JOIN relativestype_emp r ON r.relativesTypeID = f.relativesTypeID
+        order by f.employeeID
+      `    );
+
+    const [econtact] = await db.query(
+      `
+        SELECT
+          r.relativesTypeDesc AS Parentesco,
+          CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) AS Nombre,
+          e.phoneNumber AS Telefono,
+          CONCAT(st.stateName, ', ', c.cityName, ', ', se.sectorName, ', ', su.suburbName) AS Direccion,
+          e.employeeID AS Code,
+          CONCAT(emp.firstName, ' ', emp.middleName, ' ', emp.lastName, ' ', emp.secondLastName) AS Employee
+        FROM econtacts_emp e
+        INNER JOIN employees_emp emp ON emp.employeeID = e.employeeID
+        INNER JOIN relativestype_emp r ON r.relativesTypeID = e.relativesTypeID
+        INNER JOIN states_emp st ON st.stateID = e.stateID
+        INNER JOIN cities_emp c ON c.cityID = e.cityID
+        INNER JOIN sectors_emp se ON se.sectorID = e.sectorID
+        INNER JOIN suburbs_emp su ON su.suburbID = e.suburbID
+        order by e.employeeID
+      `
+    );
+
+    const [auxrelative] = await db.query(
+      `
+        SELECT
+          au.newEmployee AS NuevoEmpleado,
+          CONCAT(newEmp.codeEmployee, ' - ', newEmp.firstName, ' ', newEmp.middleName, 
+          ' ', newEmp.lastName, ' ', newEmp.secondLastName) AS NuevoEmpleadoNombre,
+          r.relativesTypeDesc,
+          au.employeeID AS Code,
+          CONCAT(e.codeEmployee, ' - ', e.firstName, ' ', 
+          e.middleName, ' ', e.lastName, ' ', e.secondLastName) AS EmployeeRelacionado
+        FROM auxrelative_emp au
+        INNER JOIN employees_emp e ON e.employeeID = au.employeeID
+        INNER JOIN employees_emp newEmp ON newEmp.employeeID = au.newEmployee
+        INNER JOIN relativestype_emp r ON r.relativesTypeID = au.relativesTypeID
+        order by au.employeeID
+      `
+    );
+
+    const [beneficiaries] = await db.query(
+      `
+        SELECT      
+          r.relativesTypeDesc,
+          CONCAT(f.firstName, ' ', f.middleName, ' ', f.lastName, ' ', f.secondLastName) AS Nombre,
+          f.percentage,
+          f.phoneNumber,
+          f.employeeID AS Code,
+          CONCAT(e.firstName, ' ', e.middleName, ' ', e.lastName, ' ', e.secondLastName) AS Employee
+        FROM beneficiaries_emp f
+        INNER JOIN employees_emp e ON e.employeeID = f.employeeID
+        INNER JOIN relativestype_emp r ON r.relativesTypeID = f.relativesTypeID
+        order by f.employeeID
+      `    );
+
+    const workbook = new ExcelJS.Workbook();
+
+    const addSheet = (sheetName, rows) => {
+      const sheet = workbook.addWorksheet(sheetName);
+
+      if (!rows || rows.length === 0) {
+        sheet.addRow(["Sin registros"]);
+        return;
+      }
+
+      const columnKeys = Object.keys(rows[0]);
+      sheet.columns = columnKeys.map((key) => ({
+        header: key,
+        key,
+        width: Math.max(14, key.length + 4),
+      }));
+
+      rows.forEach((row) => {
+        sheet.addRow(row);
+      });
+
+      sheet.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FF1F4E78" },
+        };
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+        cell.border = {
+          bottom: { style: "thin", color: { argb: "FFBFBFBF" } },
+        };
+      });
+
+      sheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          cell.border = {
+            top: { style: "thin", color: { argb: "FFCCCCCC" } },
+            left: { style: "thin", color: { argb: "FFCCCCCC" } },
+            bottom: { style: "thin", color: { argb: "FFCCCCCC" } },
+            right: { style: "thin", color: { argb: "FFCCCCCC" } },
+          };
+        });
+      });
+    };
+
+    addSheet("Informacion General", infoGeneral);
+    addSheet("Hijos", children);
+    addSheet("Familia", familyInformation);
+    addSheet("Contactos Emergencia", econtact);
+    addSheet("Parientes Auxiliares", auxrelative);
+    addSheet("Beneficiarios", beneficiaries);
+
+    const fileName = `informacion_empleado_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error al exportar información:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor al exportar información.",
+    });
+  }
+};
